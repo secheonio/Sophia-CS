@@ -475,7 +475,7 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
 
   // ---- 화면 정적 파일 (운영) ----
   if (staticDir && fs.existsSync(path.join(staticDir, 'index.html'))) {
-    const csp = "default-src 'self'; img-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+    const csp = "default-src 'self'; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
     app.use(express.static(staticDir, { index: false, setHeaders: (res) => res.set('Content-Security-Policy', csp) }))
     app.get('/{*splat}', (_req, res) => {
       res.set('Content-Security-Policy', csp)

@@ -1,0 +1,8 @@
+expense.sophiaschool.or.kr {
+	encode gzip
+	# 영수증 이미지를 포함한 품의 등록 요청(최대 40MB)을 허용한다.
+	request_body {
+		max_size 45MB
+	}
+	reverse_proxy 127.0.0.1:3001
+}

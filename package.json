@@ -11,6 +11,7 @@
     "server": "node server/index.js",
     "dev:server": "node --watch server/index.js",
     "create-admin": "node server/create-admin.js",
+    "backup": "node server/backup.js",
     "test": "node --test server/app.test.js"
   },
   "dependencies": {

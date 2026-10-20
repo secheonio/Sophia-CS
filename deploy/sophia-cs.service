@@ -1,0 +1,24 @@
+[Unit]
+Description=Sophia 지출품의 서버
+After=network.target
+
+[Service]
+Type=simple
+User=sophia
+WorkingDirectory=/opt/sophia-cs
+Environment=NODE_ENV=production
+Environment=HOST=127.0.0.1
+Environment=PORT=3001
+Environment=TRUST_PROXY=1
+Environment=DATABASE_FILE=/var/lib/sophia-cs/app.db
+ExecStart=/usr/bin/node server/index.js
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/sophia-cs
+
+[Install]
+WantedBy=multi-user.target
