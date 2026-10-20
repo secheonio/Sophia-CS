@@ -244,6 +244,64 @@ describe('열람 제한과 첨부', () => {
   })
 })
 
+const transferTests = () => describe('교장 교체', () => {
+  test('교장만 교체할 수 있고 확인이 필요하다', async () => {
+    const head = await login('head1@test.kr')
+    assert.equal((await head.post('/api/principal/transfer', { name: 'x', email: 'x@test.kr', confirm: true })).status, 403)
+    const principal = await login('principal@test.kr')
+    assert.equal((await principal.post('/api/principal/transfer', { name: 'x', email: 'x@test.kr' })).status, 400)
+    assert.equal((await principal.post('/api/principal/transfer', { userId: 2, confirm: true })).status, 400)
+  })
+
+  test('새 교장 생성: 진행 중 결재가 넘어가고 과거 품의를 모두 볼 수 있다', async () => {
+    const staff = await login('staff1@test.kr')
+    const principal = await login('principal@test.kr')
+    const accountant = await login('admin@test.kr')
+    const head2 = await login('head1@test.kr')
+    const waiting = (await staff.post('/api/requests', draft({ title: '교체 시 교장 차례' }))).json.request
+    const done = (await staff.post('/api/requests', draft({ title: '교체 전 완료' }))).json.request
+    await head2.post(`/api/requests/${waiting.id}/decision`, { action: 'approve' })
+    await head2.post(`/api/requests/${done.id}/decision`, { action: 'approve' })
+    await principal.post(`/api/requests/${done.id}/decision`, { action: 'approve' })
+    await accountant.post(`/api/requests/${done.id}/decision`, { action: 'approve' })
+
+    const result = await principal.post('/api/principal/transfer', { name: '새교장', email: 'New.Principal@test.kr', confirm: true })
+    assert.equal(result.status, 200, JSON.stringify(result.json))
+    assert.ok(result.json.temporaryPassword)
+    assert.ok(result.json.transferredSteps >= 1)
+
+    assert.equal((await principal.get('/api/me')).status, 401)
+    assert.equal((await new Client().post('/api/auth/login', { email: 'principal@test.kr', password: PASSWORD })).status, 401)
+
+    const next = await login('new.principal@test.kr', result.json.temporaryPassword)
+    assert.equal((await next.get('/api/requests')).status, 403)
+    assert.equal((await next.post('/api/auth/change-password', { currentPassword: result.json.temporaryPassword, newPassword: 'New-principal-77' })).status, 200)
+
+    const list = (await next.get('/api/requests')).json.requests
+    assert.ok(list.some((item) => item.title === '교체 전 완료'))
+    const moved = list.find((item) => item.id === waiting.id)
+    assert.equal(moved.steps[1].name, '새교장')
+    assert.equal((await next.post(`/api/requests/${waiting.id}/decision`, { action: 'approve' })).json.request.status, '지출 대기')
+    const finished = list.find((item) => item.id === done.id)
+    assert.equal(finished.steps[1].name, '이교장')
+    assert.equal((await next.get('/api/users')).status, 200)
+  })
+
+  test('기존 사용자를 교장으로 지정할 수 있고, 결재 중인 사용자와 행정실장은 막는다', async () => {
+    await addUser('후보', 'cand@test.kr', '생활관', '기안자')
+    const principal = await login('new.principal@test.kr', 'New-principal-77')
+    const users = (await principal.get('/api/users')).json.users
+    const idOf = (email) => users.find((user) => user.email === email).id
+    assert.equal((await principal.post('/api/principal/transfer', { userId: idOf('admin@test.kr'), confirm: true })).status, 400)
+    await (await login('staff1@test.kr')).post('/api/requests', draft({ title: '기관장 결재 대기' }))
+    assert.equal((await principal.post('/api/principal/transfer', { userId: idOf('head1@test.kr'), confirm: true })).status, 409)
+    const ok = await principal.post('/api/principal/transfer', { userId: idOf('cand@test.kr'), confirm: true })
+    assert.equal(ok.status, 200, JSON.stringify(ok.json))
+    assert.equal(ok.json.user.position, '교장')
+    assert.equal(ok.json.temporaryPassword, null)
+  })
+})
+
 describe('사용자 관리', () => {
   test('교장만 사용자를 관리할 수 있다', async () => {
     for (const email of ['head1@test.kr', 'admin@test.kr', 'staff1@test.kr']) {
@@ -311,3 +369,5 @@ describe('사용자 관리', () => {
     assert.equal((await again.get('/api/me')).json.user.mustChangePassword, true)
   })
 })
+
+transferTests()

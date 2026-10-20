@@ -6,6 +6,27 @@ export function UserAdmin({ me, meta, onError }: { me: User; meta: Meta; onError
   const [users, setUsers] = useState<User[]>([])
   const [form, setForm] = useState({ name: '', email: '', department: meta.departments[0], position: '기안자' as Position })
   const [issued, setIssued] = useState<{ name: string; password: string } | null>(null)
+  const [transfer, setTransfer] = useState<{ mode: 'existing' | 'new'; userId: string; name: string; email: string } | null>(null)
+
+  async function transferPrincipal(event: FormEvent) {
+    event.preventDefault()
+    if (!transfer) return
+    const target = transfer.mode === 'existing'
+      ? users.find((user) => String(user.id) === transfer.userId)?.name
+      : transfer.name
+    if (!window.confirm(`${target ?? '선택한 사용자'}님을 새 교장으로 지정합니다.\n현재 교장(${me.name})의 계정은 사용 중지되고 즉시 로그아웃됩니다.\n진행하시겠습니까?`)) return
+    try {
+      const result = await api.transferPrincipal(
+        transfer.mode === 'existing'
+          ? { userId: Number(transfer.userId), confirm: true }
+          : { name: transfer.name, email: transfer.email, confirm: true },
+      )
+      if (result.temporaryPassword) window.alert(`새 교장 임시 비밀번호: ${result.temporaryPassword}\n이 화면 이후에는 다시 볼 수 없습니다. 새 교장에게 직접 전달하세요.`)
+      window.location.reload()
+    } catch (caught) {
+      onError(caught instanceof ApiError ? caught.message : '교장을 교체하지 못했습니다.')
+    }
+  }
 
   const allowedDepartments = meta.departmentsByPosition[form.position] ?? meta.departments
 
@@ -94,6 +115,39 @@ export function UserAdmin({ me, meta, onError }: { me: User; meta: Meta; onError
           </label>
           <button className="primary-button" type="submit">추가</button>
         </form>
+      </section>
+
+      <section className="requests-panel">
+        <div className="panel-heading"><div><h2>교장 교체</h2><p>교장이 바뀔 때 관리자 권한과 결재권을 새 교장에게 넘깁니다. 진행 중인 교장 결재도 함께 넘어가고, 새 교장은 과거 품의도 모두 볼 수 있습니다.</p></div>
+          {!transfer && <button type="button" className="cancel-button" onClick={() => setTransfer({ mode: 'new', userId: '', name: '', email: '' })}>교장 교체 시작</button>}
+        </div>
+        {transfer && (
+          <form className="user-form" onSubmit={(event) => void transferPrincipal(event)}>
+            <label className="form-field"><span>방식</span>
+              <select value={transfer.mode} onChange={(e) => setTransfer({ ...transfer, mode: e.currentTarget.value as 'existing' | 'new' })}>
+                <option value="new">새 사용자로 등록</option>
+                <option value="existing">기존 사용자 지정</option>
+              </select>
+            </label>
+            {transfer.mode === 'new' ? (
+              <>
+                <label className="form-field"><span>이름</span><input value={transfer.name} onChange={(e) => setTransfer({ ...transfer, name: e.currentTarget.value })} required maxLength={30} /></label>
+                <label className="form-field"><span>이메일</span><input type="email" value={transfer.email} onChange={(e) => setTransfer({ ...transfer, email: e.currentTarget.value })} required /></label>
+              </>
+            ) : (
+              <label className="form-field"><span>새 교장</span>
+                <select value={transfer.userId} onChange={(e) => setTransfer({ ...transfer, userId: e.currentTarget.value })} required>
+                  <option value="">선택</option>
+                  {users.filter((user) => user.active && user.id !== me.id && user.position !== '행정실장').map((user) => (
+                    <option key={user.id} value={user.id}>{user.name} · {user.department} {user.position}</option>
+                  ))}
+                </select>
+              </label>
+            )}
+            <button className="cancel-button" type="button" onClick={() => setTransfer(null)}>취소</button>
+            <button className="reject-confirm" type="submit">교장 교체 실행</button>
+          </form>
+        )}
       </section>
 
       <section className="requests-panel">

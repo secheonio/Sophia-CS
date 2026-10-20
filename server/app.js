@@ -236,6 +236,66 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
     res.json({ temporaryPassword })
   })
 
+  // 교장 교체: 직책 이전과 진행 중인 결재 이관을 한 트랜잭션으로 처리한다.
+  app.post('/api/principal/transfer', ...ready, requireAdmin, smallJson, async (req, res) => {
+    const body = req.body ?? {}
+    let newUser = null
+    let temporaryPassword = null
+    let hash = null
+    if (body.userId !== undefined) {
+      newUser = q('SELECT * FROM users WHERE id = ?').get(toId(body.userId))
+      if (!newUser || !newUser.active) throw new HttpError(404, '사용 중인 사용자를 찾을 수 없습니다.')
+      if (newUser.id === req.user.id) throw new HttpError(400, '현재 교장에게는 교체할 수 없습니다.')
+      if (newUser.position === '행정실장') throw new HttpError(400, '행정실장은 교장이 될 수 없습니다.')
+    } else {
+      cleanText(body.name, '이름', { min: 1, max: 30 })
+      validateEmail(body.email)
+      temporaryPassword = generateTemporaryPassword()
+      hash = await hashPassword(temporaryPassword)
+    }
+    if (body.confirm !== true) throw new HttpError(400, '교체 확인이 필요합니다.')
+
+    try {
+      const moved = transaction(db, () => {
+        const old = q('SELECT * FROM users WHERE id = ?').get(req.user.id)
+        if (old.position !== '교장' || !old.active) throw new HttpError(409, '이미 교체되었습니다.')
+        if (newUser) {
+          const fresh = q('SELECT * FROM users WHERE id = ?').get(newUser.id)
+          if (!fresh.active) throw new HttpError(409, '사용 중지된 사용자입니다.')
+          if (hasPendingSteps(fresh.id)) {
+            throw new HttpError(409, '결재 중인 품의가 있는 사용자는 교장으로 지정할 수 없습니다. 결재가 끝난 뒤 지정해 주세요.')
+          }
+        }
+        q("UPDATE users SET active = 0 WHERE id = ?").run(old.id)
+        let target = newUser
+        if (target) {
+          q("UPDATE users SET department = '교장', position = '교장' WHERE id = ?").run(target.id)
+        } else {
+          const result = q(
+            `INSERT INTO users (email, name, department, position, password_hash, must_change_password, active, created_at)
+             VALUES (?, ?, '교장', '교장', ?, 1, 1, ?)`,
+          ).run(validateEmail(body.email), cleanText(body.name, '이름', { min: 1, max: 30 }), hash, today())
+          target = { id: Number(result.lastInsertRowid) }
+        }
+        target = q('SELECT * FROM users WHERE id = ?').get(target.id)
+        // 아직 처리되지 않은 교장 결재는 새 교장에게 넘기고, 완료된 결재는 기존 이름으로 남긴다.
+        const pending = q(
+          `SELECT DISTINCT request_id FROM request_steps WHERE user_id = ? AND status IN ('결재 중', '대기')`,
+        ).all(old.id)
+        const result = q(
+          `UPDATE request_steps SET user_id = ?, user_name = ?, user_position = '교장'
+           WHERE user_id = ? AND status IN ('결재 중', '대기')`,
+        ).run(target.id, target.name, old.id)
+        q('DELETE FROM sessions WHERE user_id = ?').run(old.id)
+        for (const item of pending) logEvent(item.request_id, old.id, '교장 교체', `${old.name} → ${target.name}`)
+        return { target, count: Number(result.changes) }
+      })
+      res.json({ user: publicUser(moved.target), temporaryPassword, transferredSteps: moved.count })
+    } catch (error) {
+      throw translateConflict(error)
+    }
+  })
+
   // ---- 지출품의 ----
   function serialize(row) {
     const steps = q('SELECT * FROM request_steps WHERE request_id = ? ORDER BY seq').all(row.id).map((step) => ({
@@ -271,6 +331,7 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
 
   // 본인이 기안했거나 결재선에 포함된 품의만 조회할 수 있습니다.
   function visibleRequest(id, user) {
+    if (user.position === '교장') return q('SELECT r.* FROM requests r WHERE r.id = ?').get(id)
     return q(
       `SELECT r.* FROM requests r WHERE r.id = ? AND (r.requester_id = ?
          OR EXISTS (SELECT 1 FROM request_steps s WHERE s.request_id = r.id AND s.user_id = ?))`,
@@ -305,11 +366,14 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
   }
 
   app.get('/api/requests', ...ready, (req, res) => {
-    const rows = q(
-      `SELECT r.* FROM requests r WHERE r.requester_id = ?
-         OR EXISTS (SELECT 1 FROM request_steps s WHERE s.request_id = r.id AND s.user_id = ?)
-       ORDER BY r.id DESC`,
-    ).all(req.user.id, req.user.id)
+    // 교장은 교체 이후에도 과거 품의를 모두 열람한다.
+    const rows = req.user.position === '교장'
+      ? q('SELECT r.* FROM requests r ORDER BY r.id DESC').all()
+      : q(
+        `SELECT r.* FROM requests r WHERE r.requester_id = ?
+           OR EXISTS (SELECT 1 FROM request_steps s WHERE s.request_id = r.id AND s.user_id = ?)
+         ORDER BY r.id DESC`,
+      ).all(req.user.id, req.user.id)
     res.json({ requests: rows.map(serialize) })
   })
 

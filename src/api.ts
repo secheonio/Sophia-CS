@@ -55,6 +55,8 @@ export const api = {
   updateUser: (id: number, input: Partial<Pick<User, 'name' | 'department' | 'position' | 'active'>>) =>
     call<{ user: User }>('PATCH', `/api/users/${id}`, input),
   resetPassword: (id: number) => call<{ temporaryPassword: string }>('POST', `/api/users/${id}/reset-password`),
+  transferPrincipal: (input: { userId?: number; name?: string; email?: string; confirm: true }) =>
+    call<{ user: User; temporaryPassword: string | null; transferredSteps: number }>('POST', '/api/principal/transfer', input),
 }
 
 export const attachmentUrl = (id: number) => `/api/attachments/${id}`
