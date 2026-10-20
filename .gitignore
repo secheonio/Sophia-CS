@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# 운영 데이터베이스 (비밀번호 해시, 영수증 이미지 포함)
+data/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
