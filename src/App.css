@@ -110,7 +110,12 @@ tbody tr:hover, tbody tr.row-selected { background: #fbfaff; }
 .amount-cell { color: #484a58; font-size: 10px; font-weight: 600; }
 .status-badge { display: inline-flex; align-items: center; min-height: 20px; padding: 0 7px; border-radius: 12px; font-size: 8px; font-weight: 600; }
 .status-결재-중 { background: #fff6e3; color: #bd8720; }
-.status-승인-완료 { background: #e9f8f0; color: #39966d; }
+.status-지출-대기 { background: #eaf3ff; color: #3f78c4; }
+.status-지출-완료 { background: #e9f8f0; color: #39966d; }
+.department-filter { height: 31px; padding: 0 8px; border: 1px solid #e9eaf0; border-radius: 6px; background: #fff; color: #626573; font-size: 10px; }
+.dept-tag { padding: 1px 5px; border-radius: 4px; background: #f4f4f8; color: #8a8d9a; font-size: 8px; }
+.preview-steps { display: grid; gap: 7px; margin: 0; padding-left: 18px; color: #5b5d6a; font-size: 10px; }
+.preview-steps span { color: #9a9ca7; font-size: 9px; }
 .status-반려 { background: #fff0f0; color: #d0646b; }
 .row-arrow { color: #b1b3bd; font-size: 19px; text-align: right; }
 .empty-state { height: 95px; color: #999ba6; text-align: center; }
@@ -133,7 +138,7 @@ tbody tr:hover, tbody tr.row-selected { background: #fbfaff; }
 .approve-button { border: 1px solid #6656e0; background: #6757e5; color: white; }
 .approve-button:hover { background: #5848d1; }
 .approve-button span { padding-left: 4px; }
-.detail-content { display: grid; grid-template-columns: 1fr 1.08fr; }
+.detail-content { display: grid; grid-template-columns: 1fr 1.6fr; }
 .request-info, .approval-flow { min-height: 142px; padding: 16px 20px; }
 .approval-flow { border-left: 1px solid #efeff3; }
 .request-info h3, .approval-flow h3 { margin: 0 0 15px; color: #525563; font-size: 10px; font-weight: 600; }
