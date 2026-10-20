@@ -21,8 +21,25 @@ interface ApprovalStep {
   date?: string
 }
 
+interface Attachment {
+  id: string
+  name: string
+  url: string
+}
+
+interface Rejection {
+  by: string
+  reason: string
+  date: string
+}
+
+const MAX_ATTACHMENTS = 5
+const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024
+
 interface ExpenseRequest {
   id: number
+  attachments: Attachment[]
+  rejection?: Rejection
   code: string
   title: string
   requester: string
@@ -74,7 +91,12 @@ function findHead(department: string) {
   )
 }
 
+function isInApprovalLine(request: ExpenseRequest, userName: string) {
+  return request.requester === userName || request.steps.some((step) => step.name === userName)
+}
+
 // 기안자 → 담당 기관장 확인 → 교장 최종 결재 → 행정실장 지출 처리
+// 행정실은 1인 체계라 행정실장이 기관장으로서 교장에게 바로 상신합니다.
 function buildSteps(requester: Person): ApprovalStep[] {
   const steps: ApprovalStep[] = []
   const head = findHead(requester.department)
@@ -99,7 +121,7 @@ function deriveStatus(steps: ApprovalStep[]): RequestStatus {
 
 function makeRequest(
   id: number,
-  fields: Omit<ExpenseRequest, 'id' | 'code' | 'status' | 'steps' | 'department'>,
+  fields: Omit<ExpenseRequest, 'id' | 'code' | 'status' | 'steps' | 'department' | 'attachments' | 'rejection'>,
   stepStates: Array<[StepStatus, string?]>,
 ): ExpenseRequest {
   const requester = findPerson(fields.requester)!
@@ -111,6 +133,7 @@ function makeRequest(
   return {
     ...fields,
     id,
+    attachments: [],
     code: `EXP-2026-${String(id).padStart(3, '0')}`,
     department: requester.department,
     steps,
@@ -119,6 +142,7 @@ function makeRequest(
 }
 
 const initialRequests: ExpenseRequest[] = [
+  makeRequest(5, { title: '행정실 사무용품 구입', requester: '박행정', category: '비품·소모품', amount: 98000, date: '2026-10-19', memo: '행정실 복사용지와 문구류 구입비입니다.' }, [['결재 중']]),
   makeRequest(4, { title: '신입 과정 교구 구입', requester: '한기안', category: '비품·소모품', amount: 185000, date: '2026-10-19', memo: '기초과정 실습용 교구 구입비입니다.' }, [['결재 중']]),
   makeRequest(3, { title: '학부모 상담 다과비', requester: '윤교무', category: '교육활동비', amount: 64000, date: '2026-10-18', memo: '학부모 상담 주간 다과 구입비입니다.' }, [['승인', '2026-10-18'], ['결재 중']]),
   makeRequest(2, { title: '현장학습 버스 대절', requester: '한기안', category: '여비교통비', amount: 920000, date: '2026-10-16', memo: '10월 현장학습 이동 버스 대절비입니다.' }, [['승인', '2026-10-16'], ['승인', '2026-10-17'], ['결재 중']]),
@@ -144,6 +168,15 @@ function StatusBadge({ status }: { status: RequestStatus }) {
 
 const emptyForm = { title: '', category: categories[0], amount: '', memo: '' }
 
+function readImage(file: File): Promise<Attachment> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve({ id: crypto.randomUUID(), name: file.name, url: String(reader.result) })
+    reader.onerror = () => reject(new Error(`${file.name} 파일을 읽지 못했습니다.`))
+    reader.readAsDataURL(file)
+  })
+}
+
 function App() {
   const [requests, setRequests] = useState(initialRequests)
   const [selectedId, setSelectedId] = useState(4)
@@ -155,12 +188,18 @@ function App() {
   const [editingId, setEditingId] = useState<number | null>(null)
   const [notice, setNotice] = useState('')
   const [form, setForm] = useState(emptyForm)
+  const [attachments, setAttachments] = useState<Attachment[]>([])
+  const [formError, setFormError] = useState('')
+  const [isRejecting, setIsRejecting] = useState(false)
+  const [rejectReason, setRejectReason] = useState('')
+  const [previewImage, setPreviewImage] = useState<Attachment | null>(null)
 
   const activePerson = findPerson(activeUser)!
   const previewSteps = buildSteps(activePerson)
-  const selectedRequest = requests.find((request) => request.id === selectedId)
+  const visibleRequests = requests.filter((request) => isInApprovalLine(request, activeUser))
+  const selectedRequest = visibleRequests.find((request) => request.id === selectedId) ?? visibleRequests[0]
   const query = search.trim().toLocaleLowerCase()
-  const filteredRequests = requests.filter((request) => {
+  const filteredRequests = visibleRequests.filter((request) => {
     const matchesFilter =
       (activeFilter === '전체' || request.status === activeFilter) &&
       (departmentFilter === '전체 부서' || request.department === departmentFilter)
@@ -173,12 +212,12 @@ function App() {
   const currentStep = selectedRequest?.steps.find((step) => step.status === '결재 중')
   const canDecide = currentStep?.name === activeUser
   const canResubmit = selectedRequest?.status === '반려' && selectedRequest.requester === activeUser
-  const waitingCount = requests.filter((request) =>
+  const waitingCount = visibleRequests.filter((request) =>
     request.steps.some((step) => step.name === activeUser && step.status === '결재 중'),
   ).length
-  const inProgressCount = requests.filter((request) => request.status === '결재 중').length
-  const payoutWaitingCount = requests.filter((request) => request.status === '지출 대기').length
-  const paidRequests = requests.filter((request) => request.status === '지출 완료')
+  const inProgressCount = visibleRequests.filter((request) => request.status === '결재 중').length
+  const payoutWaitingCount = visibleRequests.filter((request) => request.status === '지출 대기').length
+  const paidRequests = visibleRequests.filter((request) => request.status === '지출 완료')
   const paidAmount = paidRequests.reduce((sum, request) => sum + request.amount, 0)
 
   function updateForm(event: ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) {
@@ -186,39 +225,84 @@ function App() {
     setForm((current) => ({ ...current, [name]: value }))
   }
 
+  function selectRequest(id: number) {
+    setSelectedId(id)
+    setIsRejecting(false)
+    setRejectReason('')
+  }
+
+  function changeUser(name: string) {
+    setActiveUser(name)
+    setIsRejecting(false)
+    setRejectReason('')
+  }
+
   function openNewForm() {
     setNotice('')
+    setFormError('')
     setEditingId(null)
     setForm(emptyForm)
+    setAttachments([])
     setIsFormOpen(true)
   }
 
   function openEditForm(request: ExpenseRequest) {
     setNotice('')
+    setFormError('')
     setEditingId(request.id)
     setForm({ title: request.title, category: request.category, amount: String(request.amount), memo: request.memo })
+    setAttachments(request.attachments)
     setIsFormOpen(true)
+  }
+
+  async function addImages(event: ChangeEvent<HTMLInputElement>) {
+    const input = event.currentTarget
+    const files = Array.from(input.files ?? [])
+    input.value = ''
+    if (files.length === 0) return
+
+    if (attachments.length + files.length > MAX_ATTACHMENTS) {
+      setFormError(`이미지는 최대 ${MAX_ATTACHMENTS}장까지 첨부할 수 있습니다.`)
+      return
+    }
+    const invalid = files.find((file) => !file.type.startsWith('image/') || file.size > MAX_ATTACHMENT_BYTES)
+    if (invalid) {
+      setFormError(`${invalid.name}: 5MB 이하의 이미지 파일만 첨부할 수 있습니다.`)
+      return
+    }
+
+    try {
+      const added = await Promise.all(files.map(readImage))
+      setAttachments((current) => [...current, ...added])
+      setFormError('')
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : '이미지를 첨부하지 못했습니다.')
+    }
+  }
+
+  function removeImage(id: string) {
+    setAttachments((current) => current.filter((attachment) => attachment.id !== id))
   }
 
   function submitRequest(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const amount = Number(form.amount)
     if (!Number.isSafeInteger(amount) || amount <= 0) {
-      setNotice('금액은 1원 이상의 정수로 입력해 주세요.')
+      setFormError('금액은 1원 이상의 정수로 입력해 주세요.')
       return
     }
 
-    const fields = { title: form.title.trim(), category: form.category, amount, memo: form.memo.trim() }
+    const fields = { title: form.title.trim(), category: form.category, amount, memo: form.memo.trim(), attachments }
 
     if (editingId !== null) {
       setRequests((current) =>
         current.map((request) => {
           if (request.id !== editingId) return request
           const steps = buildSteps(activePerson)
-          return { ...request, ...fields, date: today(), steps, status: deriveStatus(steps) }
+          return { ...request, ...fields, date: today(), steps, status: deriveStatus(steps), rejection: undefined }
         }),
       )
-      setSelectedId(editingId)
+      selectRequest(editingId)
       setNotice('수정한 지출품의를 다시 결재 요청했습니다.')
     } else {
       const nextId = Math.max(...requests.map((request) => request.id)) + 1
@@ -234,18 +318,22 @@ function App() {
         status: deriveStatus(steps),
       }
       setRequests((current) => [newRequest, ...current])
-      setSelectedId(nextId)
+      selectRequest(nextId)
       setActiveFilter('전체')
+      setDepartmentFilter('전체 부서')
       setNotice('새 지출품의를 결재 요청했습니다.')
     }
 
     setForm(emptyForm)
+    setAttachments([])
     setEditingId(null)
     setIsFormOpen(false)
   }
 
   function decide(approval: '승인' | '반려') {
     if (!selectedRequest || !currentStep || !canDecide) return
+    const reason = rejectReason.trim()
+    if (approval === '반려' && reason.length === 0) return
 
     setRequests((current) =>
       current.map((request) => {
@@ -257,10 +345,13 @@ function App() {
         if (approval === '승인' && stepIndex + 1 < steps.length) {
           steps[stepIndex + 1] = { ...steps[stepIndex + 1], status: '결재 중' }
         }
-        return { ...request, steps, status: deriveStatus(steps) }
+        const rejection = approval === '반려' ? { by: activeUser, reason, date: today() } : request.rejection
+        return { ...request, steps, status: deriveStatus(steps), rejection }
       }),
     )
 
+    setIsRejecting(false)
+    setRejectReason('')
     if (approval === '반려') setNotice('반려했습니다. 기안자가 수정 후 다시 상신할 수 있습니다.')
     else if (currentStep.kind === '지출 처리') setNotice('지출 처리를 완료했습니다.')
     else setNotice('결재를 승인했습니다.')
@@ -302,7 +393,7 @@ function App() {
           <div className="topbar-actions">
             <span className="demo-label">시연용 사용자</span>
             <label className="sr-only" htmlFor="active-user">시연 사용자 선택</label>
-            <select id="active-user" className="user-switcher" value={activeUser} onChange={(event) => setActiveUser(event.currentTarget.value)}>
+            <select id="active-user" className="user-switcher" value={activeUser} onChange={(event) => changeUser(event.currentTarget.value)}>
               {people.map((person) => (
                 <option key={person.name} value={person.name}>{person.name} · {person.department} {person.position}</option>
               ))}
@@ -394,9 +485,9 @@ function App() {
                 </thead>
                 <tbody>
                   {filteredRequests.map((request) => (
-                    <tr key={request.id} className={selectedId === request.id ? 'row-selected' : ''} onClick={() => setSelectedId(request.id)}>
+                    <tr key={request.id} className={selectedRequest?.id === request.id ? 'row-selected' : ''}                     onClick={() => selectRequest(request.id)}>
                       <td>
-                        <button className="request-title" type="button" onClick={() => setSelectedId(request.id)}>
+                                            <button className="request-title" type="button" onClick={() => selectRequest(request.id)}>
                           <strong>{request.title}</strong><small>{request.code} <span>·</span> {request.category}</small>
                         </button>
                       </td>
@@ -424,9 +515,9 @@ function App() {
                   <h2>{selectedRequest.title}</h2>
                   <p>{selectedRequest.requester} · {selectedRequest.department} · {selectedRequest.date}</p>
                 </div>
-                {canDecide && currentStep && (
+                {canDecide && currentStep && !isRejecting && (
                   <div className="decision-actions">
-                    <button className="reject-button" type="button" onClick={() => decide('반려')}>반려</button>
+                    <button className="reject-button" type="button" onClick={() => setIsRejecting(true)}>반려</button>
                     <button className="approve-button" type="button" onClick={() => decide('승인')}>
                       {currentStep.kind === '지출 처리' ? '지출 완료 처리' : '승인하기'} <span>→</span>
                     </button>
@@ -438,6 +529,23 @@ function App() {
                   </div>
                 )}
               </div>
+              {canDecide && isRejecting && (
+                <div className="reject-panel">
+                  <label htmlFor="reject-reason">반려 사유 <i>*</i></label>
+                  <textarea id="reject-reason" value={rejectReason} onChange={(event) => setRejectReason(event.currentTarget.value)} rows={3} maxLength={300} placeholder="기안자가 수정할 수 있도록 반려 사유를 구체적으로 입력해 주세요." autoFocus />
+                  <div className="reject-actions">
+                    <button className="cancel-button" type="button" onClick={() => { setIsRejecting(false); setRejectReason('') }}>취소</button>
+                    <button className="reject-confirm" type="button" disabled={rejectReason.trim().length === 0} onClick={() => decide('반려')}>반려 확정</button>
+                  </div>
+                </div>
+              )}
+              {selectedRequest.status === '반려' && selectedRequest.rejection && (
+                <div className="rejection-note" role="note">
+                  <strong>반려 사유</strong>
+                  <p>{selectedRequest.rejection.reason}</p>
+                  <small>{selectedRequest.rejection.by} · {selectedRequest.rejection.date}</small>
+                </div>
+              )}
               <div className="detail-content">
                 <div className="request-info">
                   <h3>요청 정보</h3>
@@ -445,6 +553,20 @@ function App() {
                     <div><span>요청 금액</span><strong className="detail-amount">₩ {formatCurrency(selectedRequest.amount)}</strong></div>
                     <div><span>비용 항목</span><strong>{selectedRequest.category}</strong></div>
                     <div className="memo-info"><span>사용 목적</span><strong>{selectedRequest.memo || '기재된 메모가 없습니다.'}</strong></div>
+                    <div className="memo-info">
+                      <span>첨부 이미지 ({selectedRequest.attachments.length})</span>
+                      {selectedRequest.attachments.length === 0 ? (
+                        <strong>첨부된 이미지가 없습니다.</strong>
+                      ) : (
+                        <div className="thumb-grid">
+                          {selectedRequest.attachments.map((attachment) => (
+                            <button key={attachment.id} type="button" className="thumb" onClick={() => setPreviewImage(attachment)} aria-label={`${attachment.name} 크게 보기`}>
+                              <img src={attachment.url} alt={attachment.name} />
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
                 <div className="approval-flow">
@@ -464,10 +586,22 @@ function App() {
               </div>
             </section>
           )}
+          {visibleRequests.length === 0 && (
+            <p className="no-access-note">열람할 수 있는 지출품의가 없습니다. 본인이 기안했거나 결재선에 포함된 품의만 표시됩니다.</p>
+          )}
         </div>
       </main>
 
-      {notice && <div className="toast" role="status"><span>✓</span>{notice}<button type="button" aria-label="알림 닫기" onClick={() => setNotice('')}>×</button></div>}
+      {previewImage && (
+        <div className="modal-backdrop image-viewer" onClick={() => setPreviewImage(null)}>
+          <figure role="dialog" aria-modal="true" aria-label={previewImage.name}>
+            <img src={previewImage.url} alt={previewImage.name} />
+            <figcaption>{previewImage.name} <button type="button" onClick={() => setPreviewImage(null)}>닫기</button></figcaption>
+          </figure>
+        </div>
+      )}
+
+      {notice &&  <div className="toast" role="status"><span>✓</span>{notice}<button type="button" aria-label="알림 닫기" onClick={() => setNotice('')}>×</button></div>}
 
       {isFormOpen && (
         <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsFormOpen(false) }}>
@@ -483,12 +617,30 @@ function App() {
                 <label className="form-field"><span>요청 금액 <i>*</i></span><div className="currency-input"><span>₩</span><input name="amount" type="number" min="1" step="1" value={form.amount} onChange={updateForm} placeholder="0" required /></div></label>
               </div>
               <label className="form-field"><span>사용 목적 및 메모</span><textarea name="memo" value={form.memo} onChange={updateForm} placeholder="지출이 필요한 이유를 입력해 주세요." rows={3} maxLength={500} /></label>
+              <div className="form-field">
+                <span>영수증·견적서 이미지 ({attachments.length}/{MAX_ATTACHMENTS})</span>
+                <label className="file-picker">
+                  <input type="file" accept="image/*" multiple onChange={addImages} disabled={attachments.length >= MAX_ATTACHMENTS} />
+                  <span>＋ 이미지 선택 (장당 5MB 이하)</span>
+                </label>
+                {attachments.length > 0 && (
+                  <div className="thumb-grid">
+                    {attachments.map((attachment) => (
+                      <div key={attachment.id} className="thumb editable">
+                        <img src={attachment.url} alt={attachment.name} />
+                        <button type="button" onClick={() => removeImage(attachment.id)} aria-label={`${attachment.name} 삭제`}>×</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
               <div className="approval-form-section">
                 <div className="form-section-heading"><span>결재선 (자동 지정)</span><small>기안자의 부서 기준으로 정해집니다.</small></div>
                 <ol className="preview-steps">
                   {previewSteps.map((step) => <li key={step.kind}><strong>{step.name}</strong> <span>{step.kind} · {step.position}</span></li>)}
                 </ol>
               </div>
+              {formError && <p className="form-error" role="alert">{formError}</p>}
               <div className="modal-footer"><button className="cancel-button" type="button" onClick={() => setIsFormOpen(false)}>취소</button><button className="primary-button" type="submit">{editingId === null ? '결재 요청' : '재상신'} <span>→</span></button></div>
             </form>
           </section>

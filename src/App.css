@@ -116,6 +116,30 @@ tbody tr:hover, tbody tr.row-selected { background: #fbfaff; }
 .dept-tag { padding: 1px 5px; border-radius: 4px; background: #f4f4f8; color: #8a8d9a; font-size: 8px; }
 .preview-steps { display: grid; gap: 7px; margin: 0; padding-left: 18px; color: #5b5d6a; font-size: 10px; }
 .preview-steps span { color: #9a9ca7; font-size: 9px; }
+.reject-panel { display: grid; gap: 8px; padding: 14px 20px; border-bottom: 1px solid #f3dfe0; background: #fffafa; }
+.reject-panel label { color: #b5555b; font-size: 10px; font-weight: 600; }
+.reject-panel label i { font-style: normal; }
+.reject-panel textarea { width: 100%; padding: 8px 10px; border: 1px solid #f0d4d6; border-radius: 6px; font-size: 10px; resize: vertical; }
+.reject-actions { display: flex; justify-content: flex-end; gap: 7px; }
+.reject-confirm { min-height: 31px; padding: 0 12px; border: 1px solid #cf5f66; border-radius: 6px; background: #d4636a; color: #fff; font-size: 10px; font-weight: 600; }
+.reject-confirm:disabled { border-color: #ecd0d2; background: #efd9da; cursor: not-allowed; }
+.rejection-note { display: grid; gap: 4px; padding: 12px 20px; border-bottom: 1px solid #f3dfe0; background: #fff6f6; color: #a8494f; font-size: 10px; }
+.rejection-note p { margin: 0; color: #5f3f42; font-size: 10px; line-height: 1.6; }
+.rejection-note small { color: #b98a8d; font-size: 8px; }
+.thumb-grid { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+.thumb { position: relative; width: 74px; height: 74px; padding: 0; overflow: hidden; border: 1px solid #e6e7ed; border-radius: 6px; background: #f7f7fa; }
+.thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.thumb.editable > button { position: absolute; top: 2px; right: 2px; width: 18px; height: 18px; border: 0; border-radius: 50%; background: #000a; color: #fff; font-size: 12px; line-height: 1; }
+.file-picker { display: block; padding: 9px 10px; border: 1px dashed #cfcdea; border-radius: 6px; background: #faf9ff; color: #6354d6; font-size: 10px; font-weight: 500; cursor: pointer; }
+.file-picker input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.file-picker:focus-within { outline: 3px solid #c5bfff; }
+.form-error { margin: 0; padding: 8px 10px; border-radius: 6px; background: #fff0f0; color: #bd4c53; font-size: 10px; }
+.no-access-note { margin: 17px 0 0; padding: 18px; border: 1px dashed #dcdce5; border-radius: 9px; color: #8a8d9a; font-size: 11px; text-align: center; }
+.image-viewer { z-index: 7; background: #101020cc; }
+.image-viewer figure { display: grid; gap: 8px; max-width: 90vw; margin: 0; }
+.image-viewer img { max-width: 90vw; max-height: 82vh; border-radius: 8px; background: #fff; }
+.image-viewer figcaption { display: flex; align-items: center; justify-content: center; gap: 10px; color: #fff; font-size: 11px; }
+.image-viewer figcaption button { padding: 3px 10px; border: 1px solid #fff6; border-radius: 5px; background: transparent; color: #fff; }
 .status-반려 { background: #fff0f0; color: #d0646b; }
 .row-arrow { color: #b1b3bd; font-size: 19px; text-align: right; }
 .empty-state { height: 95px; color: #999ba6; text-align: center; }
