@@ -1,6 +1,455 @@
-# 배포 안내서 (학교 안 Ubuntu 서버)
+# 학교 Ubuntu 서버 설치·배포 안내서
 
-주소: `https://expense.sophiaschool.or.kr` (학교 홈페이지 `www`는 그대로 두고 하위 주소만 추가)
+이 문서는 “학교 컴퓨터에서 윈도우를 제거하고 Ubuntu만 설치한 상태”에서 시작하는 작업 절차입니다.
+
+현재 기준 아키텍처는 다음과 같습니다.
+
+- 개발: 집/노트북에서 VS Code로 코드 수정
+- 저장: GitHub에 업로드
+- 실행 서버: 학교 내부 LAN에 연결된 Ubuntu 서버
+- 외부 공개: Cloudflare Tunnel + Cloudflare 도메인
+- 운영 주소 예시: `https://expense.example.com`
+
+학교 네트워크는 보통 다음처럼 보입니다.
+
+- Ubuntu 서버: 같은 LAN 안에 연결 (`192.168.1.x` 대역)
+- 게이트웨이: `192.168.1.254`
+- 인터넷: 외부 통신 가능 (`ping 8.8.8.8`, `curl https://example.com` 확인됨)
+- 공개 IP 직접 포트포워딩 불필요: Cloudflare Tunnel 사용
+
+아래 순서대로 진행하면 됩니다.
+
+## 0. 학교 방문 전 체크리스트
+
+- Ubuntu 설치 USB 준비
+- 학교 LAN에 연결할 수 있는 케이블 또는 Wi‑Fi 확인
+- 서버를 연결할 위치를 정함: 메인 스위치 또는 라우터의 LAN 포트
+- Cloudflare에 도메인 등록 완료
+- GitHub 저장소에 코드가 push된 상태
+- 학교에서 SSH 접속용 계정/비밀번호 준비
+
+## 1. Ubuntu 설치
+
+1. Ubuntu 22.04 LTS 이상 ISO를 준비합니다.
+2. USB 부팅으로 설치합니다.
+3. 언어/키보드/시간대를 선택합니다.
+4. 사용자 이름을 정합니다. 권장:
+   - 사용자 이름: `sophia`
+   - 컴퓨터 이름: `sophia-school-server`
+5. 설치가 끝나면 재시작합니다.
+6. 처음 로그인 후, 터미널을 엽니다.
+
+## 2. Ubuntu 네트워크 확인
+
+학교 LAN의 IP는 보통 `192.168.1.x` 대역이며, 게이트웨이는 `192.168.1.254`입니다.
+
+아래 명령으로 현재 상태를 확인합니다.
+
+```bash
+ip a
+ip route
+cat /etc/netplan/*.yaml
+```
+
+정상적으로 보이면 대략 다음과 같습니다.
+
+```bash
+# 예시
+inet 192.168.1.50/24
+default via 192.168.1.254
+```
+
+인터넷이 되는지 확인합니다.
+
+```bash
+ping -c 4 8.8.8.8
+curl -I https://example.com
+```
+
+정상이라면 다음 단계로 진행합니다.
+
+### 2-1. 학교 LAN에 맞는 네트워크 설정 예시
+
+`/etc/netplan/50-cloud-init.yaml` 또는 비슷한 파일을 수정합니다.
+
+```bash
+sudo nano /etc/netplan/01-netcfg.yaml
+```
+
+예시:
+
+```yaml
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    eth0:
+      dhcp4: false
+      addresses:
+        - 192.168.1.50/24
+      routes:
+        - to: default
+          via: 192.168.1.254
+      nameservers:
+        addresses: [8.8.8.8, 1.1.1.1]
+```
+
+적용:
+
+```bash
+sudo netplan generate
+sudo netplan apply
+ip a
+ip route
+```
+
+필요하면 학교 네트워크 담당자가 제공한 DNS/IP 대역을 반영해 주세요.
+
+> 참고: 학교에 보안 정책상 DHCP가 막혀 있으면 고정 IP를 직접 지정하는 방식이 가장 안전합니다.
+
+## 3. Ubuntu 기본 보안 설정
+
+```bash
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y curl git ufw ca-certificates gnupg
+sudo usermod -aG sudo sophia
+```
+
+필수 방화벽 규칙:
+
+```bash
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow 22/tcp
+sudo ufw enable
+sudo ufw status
+```
+
+> 22번 포트는 내부망/관리용으로만 허용하세요. 공공 인터넷으로 직접 SSH를 열지 마세요.
+
+## 4. Node.js 설치
+
+Node.js 24 권장입니다.
+
+```bash
+curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
+sudo apt install -y nodejs
+node -v
+npm -v
+```
+
+## 5. 프로젝트 내려받기
+
+```bash
+cd /opt
+sudo git clone https://github.com/secheonio/Sophia-CS.git sophia-cs
+sudo chown -R sophia:sophia /opt/sophia-cs
+cd /opt/sophia-cs
+npm ci
+npm run build
+```
+
+정상이라면 빌드가 끝나고 `dist` 또는 결과물이 생성됩니다.
+
+## 6. 앱 실행 준비
+
+프로젝트 폴더를 확인하고 서버 실행 포트를 점검합니다. 현재 앱은 보통 `3001` 포트를 사용합니다.
+
+```bash
+cat package.json
+```
+
+실행 명령 확인:
+
+```bash
+npm run start -- --help
+```
+
+필요한 경우 서버 포트와 환경변수를 확인합니다.
+
+## 7. systemd 서비스 등록
+
+`/etc/systemd/system/sophia-cs.service` 파일을 만듭니다.
+
+```bash
+sudo nano /etc/systemd/system/sophia-cs.service
+```
+
+예시:
+
+```ini
+[Unit]
+Description=Sophia CS app
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sophia-cs
+ExecStart=/usr/bin/npm start
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+User=sophia
+Group=sophia
+
+[Install]
+WantedBy=multi-user.target
+```
+
+적용:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable sophia-cs
+sudo systemctl start sophia-cs
+sudo systemctl status sophia-cs --no-pager
+```
+
+서비스가 정상 상태인지 확인합니다.
+
+```bash
+curl -I http://127.0.0.1:3001
+```
+
+이 응답이 오면 앱이 실행 중입니다.
+
+## 8. Cloudflare 설정 준비
+
+학교에서 포트 80/443을 직접 여는 대신 Cloudflare Tunnel 방식을 사용합니다.
+
+필수 준비물:
+
+- Cloudflare 계정
+- 도메인 소유권 확인 완료
+- `expense.example.com` 같은 서브도메인 확인
+
+1. Ubuntu 서버에 `cloudflared` 설치
+
+```bash
+curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+sudo dpkg -i cloudflared.deb
+cloudflared --version
+```
+
+2. 로그인
+
+```bash
+cloudflared tunnel login
+```
+
+브라우저가 열리면 Cloudflare 계정으로 로그인합니다. 인증서가 생성됩니다.
+
+3. 터널 생성
+
+```bash
+cloudflared tunnel create sophia-school
+```
+
+결과로 다음과 같은 값이 나옵니다.
+
+- tunnel ID
+- credentials 파일 경로
+
+4. 설정 파일 작성
+
+```bash
+mkdir -p ~/.cloudflared
+nano ~/.cloudflared/config.yml
+```
+
+예시:
+
+```yaml
+tunnel: <TUNNEL_ID>
+credentials-file: /home/sophia/.cloudflared/<TUNNEL_ID>.json
+
+ingress:
+  - hostname: expense.example.com
+    service: http://localhost:3001
+  - service: http_status:404
+```
+
+5. DNS 등록
+
+```bash
+cloudflared tunnel route dns sophia-school expense.example.com
+```
+
+6. 터널 실행
+
+```bash
+cloudflared tunnel run sophia-school
+```
+
+터널이 정상 동작하면, 브라우저에서 다음 주소로 접속할 수 있습니다.
+
+```text
+https://expense.example.com
+```
+
+## 9. Cloudflare 터널을 자동 실행으로 설정
+
+`systemd` 서비스로 등록합니다.
+
+```bash
+sudo nano /etc/systemd/system/cloudflared.service
+```
+
+예시:
+
+```ini
+[Unit]
+Description=Cloudflare Tunnel
+After=network.target
+
+[Service]
+Type=simple
+User=sophia
+ExecStart=/usr/local/bin/cloudflared tunnel run sophia-school
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+적용:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now cloudflared
+sudo systemctl status cloudflared --no-pager
+```
+
+## 10. 첫 관리자 계정 만들기
+
+프로젝트에 기본 관리자 생성 스크립트가 있다면 아래처럼 실행합니다.
+
+```bash
+cd /opt/sophia-cs
+DATABASE_FILE=/var/lib/sophia-cs/app.db npm run create-admin -- "교장" principal@school.example
+```
+
+비밀번호를 입력하거나 임시 비밀번호를 사용합니다.
+
+브라우저에서 확인:
+
+```text
+https://expense.example.com
+```
+
+로그인 후 사용자/직책 화면에서 나머지 사용자를 추가합니다.
+
+## 11. 백업 설정
+
+### 11-1. 서버 백업
+
+```bash
+sudo mkdir -p /var/backups/sophia-cs
+sudo chown -R sophia:sophia /var/backups/sophia-cs
+```
+
+매일 3시 자동 백업 스크립트 예시:
+
+```bash
+sudo crontab -e
+```
+
+추가:
+
+```cron
+0 3 * * * /opt/sophia-cs/deploy/backup.sh
+```
+
+### 11-2. Windows PC로 백업 받기
+
+클라우드 또는 학교 PC에서 별도 백업 스크립트를 돌릴 수 있습니다. 시작하기 전에 서버의 SSH 접속과 공개키 설정을 확인합니다.
+
+## 12. 학교에서 바로 점검할 체크리스트
+
+학교에 가서 아래 순서대로 확인하면 됩니다.
+
+- [ ] Ubuntu 서버 전원 연결, 부팅 완료
+- [ ] 학교 LAN에 정상 연결됨
+- [ ] `ip a` 결과 확인
+- [ ] `ip route`에서 게이트웨이 확인
+- [ ] `ping 8.8.8.8` 성공
+- [ ] `curl https://example.com` 성공
+- [ ] `sudo apt update` 성공
+- [ ] `node -v` / `npm -v` 성공
+- [ ] GitHub 저장소가 클론됨
+- [ ] `npm ci` 성공
+- [ ] `npm run build` 성공
+- [ ] `systemctl status sophia-cs`에서 running 확인
+- [ ] `curl http://127.0.0.1:3001` 성공
+- [ ] Cloudflare Tunnel 연결 확인
+- [ ] `https://expense.example.com` 접속 확인
+- [ ] 첫 교장 계정 로그인 성공
+- [ ] 관리자 화면에서 사용자 추가 가능 확인
+
+## 13. 가장 자주 발생하는 문제
+
+### 13-1. 네트워크 불가
+
+```bash
+ip a
+ip route
+cat /etc/resolv.conf
+ping 8.8.8.8
+```
+
+- 학교 LAN 설정이 잘못되었는지 확인
+- 게이트웨이와 서브넷이 올바른지 확인
+- DHCP 또는 고정 IP가 제대로 주어졌는지 확인
+
+### 13-2. 인터넷은 되는데 앱 접속이 안 됨
+
+```bash
+sudo systemctl status sophia-cs --no-pager
+journalctl -u sophia-cs -n 50 --no-pager
+```
+
+- 포트 3001이 열려 있는지 확인
+- `.env` 또는 환경변수 설정 누락 여부 확인
+- 앱 로그 확인
+
+### 13-3. Cloudflare 연결이 안 됨
+
+```bash
+cloudflared tunnel run sophia-school
+journalctl -u cloudflared -n 50 --no-pager
+```
+
+- 도메인 DNS 기록이 올바른지 확인
+- tunnel ID와 credentials 파일이 맞는지 확인
+- 로그를 보고 에러 메시지 확인
+
+## 14. 다음 작업
+
+다음 단계는 다음과 같습니다.
+
+1. 첫 교장 계정 생성
+2. 사용자/부서/직책 등록
+3. 실제 결재자 흐름 테스트
+4. 이미지 첨부 테스트
+5. 반려 사유 필수 입력 테스트
+6. 백업 복구 연습
+7. 실제 운영 전 최종 검증
+
+## 15. 마지막으로
+
+이 문서는 학교에 직접 가서 따라 하기 위한 운영용 체크리스트입니다.
+
+- 네트워크 연결 상태 확인
+- Ubuntu 설치
+- 앱 배포
+- Cloudflare 리버스 프록시 연결
+- 첫 관리자 생성
+- 실제 페이지 접속 확인
+
+이 순서만 지켜도 학교 서버 운영은 시작할 수 있습니다.
+
+필요하면 이 문서를 기준으로 실제 서버용 `README` 또는 `운영 절차서`를 별도 파일로 정리해 둡니다.
 
 ```
 사용자 브라우저 ──HTTPS──> 학교 공유기(고정 IP 1.217.30.146) ──80/443──> Ubuntu 서버
