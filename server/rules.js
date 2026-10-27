@@ -1,9 +1,9 @@
-export const DEPARTMENTS = [
-  '기초과정', '본과정', '심화과정', '생활교육부', '교무부',
-  '교육과정부', '델포이', '생활관', '행정실',
-]
+export const COURSE_DEPARTMENTS = ['기초과정', '본과정', '심화과정']
+export const DEPARTMENT_DEPARTMENTS = ['교무부', '생활교육부', '교육과정연구부']
+export const INSTITUTION_DEPARTMENTS = ['행정실', '델포이', '생활관', '전형위원회', '기타']
+export const DEPARTMENTS = [...COURSE_DEPARTMENTS, ...DEPARTMENT_DEPARTMENTS, ...INSTITUTION_DEPARTMENTS]
 export const CATEGORIES = ['교육활동비', '여비교통비', '비품·소모품', '시설·수선비', '복리후생비', '기타']
-export const POSITIONS = ['교장', '행정실장', '기관장', '기안자']
+export const POSITIONS = ['없음', '기안자', '기관장', '교장', '행정실장']
 
 export const PRINCIPAL_DEPARTMENT = '교장'
 export const ACCOUNTING_DEPARTMENT = '행정실'
@@ -19,14 +19,43 @@ export class HttpError extends Error {
   }
 }
 
+export function departmentGroup(department) {
+  if (COURSE_DEPARTMENTS.includes(department)) return '과정'
+  if (DEPARTMENT_DEPARTMENTS.includes(department)) return '부서'
+  if (INSTITUTION_DEPARTMENTS.includes(department)) return '기관'
+  return null
+}
+
 export function departmentsByPosition() {
-  const regular = DEPARTMENTS.filter((department) => department !== ACCOUNTING_DEPARTMENT)
+  const openDepartments = DEPARTMENTS.filter((department) => department !== PRINCIPAL_DEPARTMENT && department !== ACCOUNTING_DEPARTMENT)
   return {
+    없음: DEPARTMENTS,
     교장: [PRINCIPAL_DEPARTMENT],
     행정실장: [ACCOUNTING_DEPARTMENT],
-    기관장: regular,
-    기안자: regular,
+    기관장: openDepartments,
+    기안자: openDepartments,
   }
+}
+
+export function normalizeRoleList(value, fallback = []) {
+  const list = Array.isArray(value) ? value : typeof value === 'string' ? JSON.parse(value || '[]') : fallback
+  if (!Array.isArray(list)) return fallback
+  return [...new Set(list.filter((item) => DEPARTMENTS.includes(item) || item === '교장' || item === '행정실'))]
+}
+
+export function parseMultiValue(value) {
+  if (Array.isArray(value)) return value.filter(Boolean)
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (!trimmed) return []
+    try {
+      const parsed = JSON.parse(trimmed)
+      return Array.isArray(parsed) ? parsed.filter(Boolean) : [trimmed]
+    } catch {
+      return trimmed.split(',').map((item) => item.trim()).filter(Boolean)
+    }
+  }
+  return []
 }
 
 export function validateRole(department, position) {
@@ -34,6 +63,12 @@ export function validateRole(department, position) {
   if (!allowed) throw new HttpError(400, '올바르지 않은 직책입니다.')
   if (!allowed.includes(department)) {
     throw new HttpError(400, `${position}의 소속으로 선택할 수 없는 부서입니다.`)
+  }
+}
+
+export function validateTargetDepartment(department) {
+  if (!DEPARTMENTS.includes(department)) {
+    throw new HttpError(400, '기안 대상 소속이 올바르지 않습니다.')
   }
 }
 
@@ -51,10 +86,18 @@ export function cleanText(value, label, { min = 0, max }) {
 
 export function validateEmail(value) {
   const email = cleanText(value, '이메일', { min: 3, max: 120 }).toLowerCase()
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    throw new HttpError(400, '이메일 형식이 올바르지 않습니다.')
+  if (!/^[^@\s]+@[^@\s]+$/.test(email)) {
+    throw new HttpError(400, '이메일 형식이 올바르지 않습니다. (예: sophia@school.or.kr)')
   }
   return email
+}
+
+export function validatePhone(value) {
+  const phone = cleanText(value, '전화번호', { min: 10, max: 30 })
+  if (!/^\d{3}-\d{4}-\d{4}$/.test(phone)) {
+    throw new HttpError(400, '전화번호 형식이 올바르지 않습니다. (예: 010-1234-5678)')
+  }
+  return phone
 }
 
 export function validatePassword(value) {
@@ -113,11 +156,18 @@ export function deriveStatus(steps) {
   if (steps.some((step) => step.status === '반려')) return '반려'
   if (steps.every((step) => step.status === '승인')) return '지출 완료'
   const current = steps.find((step) => step.status === '결재 중')
-  return current?.kind === '지출 처리' ? '지출 대기' : '결재 중'
+  if (!current) return '결재 중'
+  const paymentKinds = new Set([
+    '행정실장 지출처리',
+    '행정실장(지출처리)',
+    '지출 처리',
+    '교장 결재, 지출처리 요청',
+  ])
+  return paymentKinds.has(current.kind) ? '지출 대기' : '결재 중'
 }
 
-// 기안자 → 담당 기관장 확인 → 교장 최종 결재 → 행정실장 지출 처리
-// 기관장·행정실장이 기안하면 기관장 확인을 건너뛰고, 교장이 기안하면 지출 처리만 남습니다.
+// 기안자 → 선택한 소속의 장 결재 → 행정실장(교장 결재 대기중) → 교장 결재 → 행정실장 지출처리
+// 행정실장은 경유 단계에서 결재선을 잠시 보관하고, 교장 결재 후 최종 지출 처리 담당으로 이어진다.
 export function buildSteps(db, requester) {
   const find = (sql, ...params) => db.prepare(sql).get(...params)
   const principal = find("SELECT * FROM users WHERE position = '교장' AND active = 1")
@@ -126,19 +176,19 @@ export function buildSteps(db, requester) {
     throw new HttpError(409, '교장 또는 행정실장이 지정되지 않아 결재선을 만들 수 없습니다. 관리자에게 문의해 주세요.')
   }
 
+  const targetDepartment = requester.department
   const steps = []
-  if (requester.position === '기안자') {
-    const head = find(
-      "SELECT * FROM users WHERE position = '기관장' AND department = ? AND active = 1",
-      requester.department,
-    )
-    if (!head) {
-      throw new HttpError(409, `${requester.department}에 기관장이 지정되지 않아 결재선을 만들 수 없습니다. 관리자에게 문의해 주세요.`)
-    }
-    steps.push({ user: head, kind: '확인 결재' })
+  const head = find(
+    "SELECT * FROM users WHERE position = '기관장' AND department = ? AND active = 1",
+    targetDepartment,
+  )
+  if (!head && targetDepartment !== '교장' && targetDepartment !== '행정실') {
+    throw new HttpError(409, `${targetDepartment}에 소속장이 지정되지 않아 결재선을 만들 수 없습니다. 관리자에게 문의해 주세요.`)
   }
-  if (requester.position !== '교장') steps.push({ user: principal, kind: '최종 결재' })
-  steps.push({ user: accountant, kind: '지출 처리' })
+  if (head) steps.push({ user: head, kind: '소속장 결재' })
+  steps.push({ user: accountant, kind: '교장 결재 대기중' })
+  steps.push({ user: principal, kind: '교장 결재' })
+  steps.push({ user: accountant, kind: '행정실장 지출처리' })
 
   return steps.map((step, index) => ({
     userId: step.user.id,

@@ -5,7 +5,7 @@ import { transaction, today } from './db.js'
 import {
   CATEGORIES, DEPARTMENTS, HttpError, MAX_ATTACHMENTS, MAX_ATTACHMENT_BYTES, POSITIONS,
   buildSteps, cleanText, decodeImage, departmentsByPosition, deriveStatus,
-  validateEmail, validatePassword, validateRequestFields, validateRole,
+  validateEmail, validatePassword, validatePhone, validateRequestFields, validateRole, validateTargetDepartment,
 } from './rules.js'
 import {
   DUMMY_HASH, createLoginLimiter, generateTemporaryPassword, hashPassword,
@@ -15,14 +15,31 @@ import {
 const SESSION_MS = 12 * 60 * 60 * 1000
 const COOKIE_NAME = 'sid'
 const BIG_JSON_LIMIT = '40mb'
+const ADMIN_RESET_PASSWORD = 'sophia00'
+
+function parseList(value) {
+  if (Array.isArray(value)) return value
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value)
+      return Array.isArray(parsed) ? parsed : []
+    } catch {
+      return value.split(',').map((item) => item.trim()).filter(Boolean)
+    }
+  }
+  return []
+}
 
 function publicUser(user) {
   return {
     id: user.id,
     name: user.name,
-    email: user.email,
+    email: user.email ?? '',
+    phone: user.phone ?? '',
     department: user.department,
     position: user.position,
+    departments: parseList(user.departments),
+    positions: parseList(user.positions),
     mustChangePassword: Boolean(user.must_change_password),
     active: Boolean(user.active),
   }
@@ -54,13 +71,22 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
 
   app.use('/api', (req, res, next) => {
     res.set('Cache-Control', 'no-store')
-    if (req.method !== 'GET' && req.method !== 'HEAD') {
-      const origin = req.get('origin')
-      if (origin && origin !== `${req.protocol}://${req.get('host')}`) {
-        return next(new HttpError(403, '허용되지 않은 요청 출처입니다.'))
-      }
-      if (!req.is('application/json')) return next(new HttpError(415, 'JSON 형식의 요청만 받을 수 있습니다.'))
+    if (req.method === 'GET' || req.method === 'HEAD') return next()
+
+    const origin = req.get('origin')
+    const host = req.get('host')
+    const sameOrigin = !!host && origin === `${req.protocol}://${host}`
+    const loopbackOrigin = !!origin && /^https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::\d+)?$/.test(origin)
+
+    if (origin && !sameOrigin && !loopbackOrigin) {
+      return next(new HttpError(403, '허용되지 않은 요청 출처입니다.'))
     }
+
+    const contentType = req.headers['content-type'] ?? ''
+    if (!contentType.toLowerCase().includes('application/json')) {
+      return next(new HttpError(415, 'JSON 형식의 요청만 받을 수 있습니다.'))
+    }
+
     next()
   })
 
@@ -108,19 +134,21 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
   // ---- 인증 ----
   app.post('/api/auth/login', smallJson, async (req, res) => {
     const body = req.body ?? {}
-    const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : ''
+    const submittedName = typeof body.name === 'string' ? body.name.trim() : ''
+    const submittedEmail = typeof body.email === 'string' ? body.email.trim().toLowerCase() : ''
     const password = typeof body.password === 'string' ? body.password : ''
-    const emailKey = `e:${email}`
-    const keys = [emailKey, `i:${req.ip}`]
+    const loginValue = submittedName || submittedEmail
+    const key = submittedName ? `n:${submittedName}` : `e:${submittedEmail}`
+    const keys = [key, `i:${req.ip}`]
     if (limiter.blocked(keys)) throw new HttpError(429, '로그인 시도가 너무 많습니다. 10분 후 다시 시도해 주세요.')
 
-    const user = q('SELECT * FROM users WHERE email = ?').get(email)
+    const user = q('SELECT * FROM users WHERE name = ? OR email = ?').get(loginValue, loginValue)
     const valid = await verifyPassword(password, user?.password_hash ?? DUMMY_HASH)
     if (!user || !user.active || !valid) {
       limiter.fail(keys)
-      throw new HttpError(401, '이메일 또는 비밀번호가 올바르지 않습니다.')
+      throw new HttpError(401, '이름 또는 비밀번호가 올바르지 않습니다.')
     }
-    limiter.reset([emailKey])
+    limiter.reset([key])
     startSession(res, user.id)
     res.json({ user: publicUser(user) })
   })
@@ -135,19 +163,51 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
 
   app.post('/api/auth/change-password', requireAuth, smallJson, async (req, res) => {
     const body = req.body ?? {}
-    if (!(await verifyPassword(body.currentPassword, req.user.password_hash))) {
+    const currentPassword = typeof body.currentPassword === 'string' ? body.currentPassword : ''
+    if (!currentPassword) throw new HttpError(400, '현재 비밀번호를 입력해 주세요.')
+    if (!(await verifyPassword(currentPassword, req.user.password_hash))) {
       throw new HttpError(400, '현재 비밀번호가 올바르지 않습니다.')
     }
-    const next = validatePassword(body.newPassword)
-    if (next === body.currentPassword) throw new HttpError(400, '새 비밀번호는 현재 비밀번호와 달라야 합니다.')
-    const hash = await hashPassword(next)
-    q('UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?').run(hash, req.user.id)
+
+    const rawNewPassword = typeof body.newPassword === 'string' ? body.newPassword.trim() : ''
+    const wantsPasswordChange = rawNewPassword.length > 0
+    let nextPassword = ''
+    if (wantsPasswordChange) {
+      nextPassword = validatePassword(rawNewPassword)
+      if (nextPassword === currentPassword) throw new HttpError(400, '새 비밀번호는 현재 비밀번호와 달라야 합니다.')
+    }
+
+    const emailValue = typeof body.email === 'string' ? body.email.trim() : (req.user.email ?? '')
+    const phoneValue = typeof body.phone === 'string' ? body.phone.trim() : (req.user.phone ?? '')
+    const requireContact = body.email !== undefined || body.phone !== undefined
+    if (requireContact) {
+      if (!emailValue) throw new HttpError(400, '이메일을 입력해 주세요.')
+      if (!phoneValue) throw new HttpError(400, '전화번호를 입력해 주세요.')
+      const normalizedEmail = validateEmail(emailValue)
+      const normalizedPhone = validatePhone(phoneValue)
+      const existing = q('SELECT id FROM users WHERE email = ? AND id != ?').get(normalizedEmail, req.user.id)
+      if (existing) throw new HttpError(409, '이미 등록된 이메일입니다.')
+      q('UPDATE users SET email = ?, phone = ? WHERE id = ?').run(normalizedEmail, normalizedPhone, req.user.id)
+    }
+
+    if (wantsPasswordChange) {
+      const hash = await hashPassword(nextPassword)
+      q('UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?').run(hash, req.user.id)
+    }
+
     q('DELETE FROM sessions WHERE user_id = ?').run(req.user.id)
+    const refreshed = q('SELECT * FROM users WHERE id = ?').get(req.user.id)
     startSession(res, req.user.id)
-    res.json({ user: publicUser({ ...req.user, must_change_password: 0 }) })
+    res.json({ user: publicUser(refreshed) })
   })
 
   app.get('/api/meta', ...ready, (_req, res) => {
+    const budgetDepartments = ['기초과정', '본과정', '심화과정', '교무부', '교육과정연구부', '생활교육부', '전형위원회', '델포이', '생활관', '행정실']
+    const budgetCatalog = {}
+    for (const department of budgetDepartments) {
+      const row = q('SELECT rows_json FROM budget_master WHERE department = ?').get(department)
+      budgetCatalog[department] = row ? JSON.parse(row.rows_json) : []
+    }
     res.json({
       departments: DEPARTMENTS,
       categories: CATEGORIES,
@@ -155,6 +215,8 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
       departmentsByPosition: departmentsByPosition(),
       maxAttachments: MAX_ATTACHMENTS,
       maxAttachmentBytes: MAX_ATTACHMENT_BYTES,
+      budgetDepartments,
+      budgetCatalog,
     })
   })
 
@@ -179,15 +241,24 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
   app.post('/api/users', ...ready, requireAdmin, smallJson, async (req, res) => {
     const body = req.body ?? {}
     const name = cleanText(body.name, '이름', { min: 1, max: 30 })
-    const email = validateEmail(body.email)
-    validateRole(body.department, body.position)
+    const emailValue = typeof body.email === 'string' ? body.email.trim() : ''
+    const email = emailValue ? validateEmail(emailValue) : null
+    const phoneValue = typeof body.phone === 'string' ? body.phone.trim() : ''
+    const phone = phoneValue ? validatePhone(phoneValue) : ''
+    const departments = Array.isArray(body.departments) ? body.departments : [body.department ?? '기타']
+    const positions = Array.isArray(body.positions) ? body.positions : [body.position ?? '기안자']
+    if (!departments.length) throw new HttpError(400, '소속을 1개 이상 선택해 주세요.')
+    if (!positions.length) throw new HttpError(400, '직책을 1개 이상 선택해 주세요.')
+    const primaryDepartment = departments[0]
+    const primaryPosition = positions[0]
+    validateRole(primaryDepartment, primaryPosition)
     const temporaryPassword = generateTemporaryPassword()
     const hash = await hashPassword(temporaryPassword)
     try {
       const result = q(
-        `INSERT INTO users (email, name, department, position, password_hash, must_change_password, active, created_at)
-         VALUES (?, ?, ?, ?, ?, 1, 1, ?)`,
-      ).run(email, name, body.department, body.position, hash, today())
+        `INSERT INTO users (email, name, department, position, departments, positions, phone, password_hash, must_change_password, active, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?)`,
+      ).run(email, name, primaryDepartment, primaryPosition, JSON.stringify(departments), JSON.stringify(positions), phone || null, hash, today())
       const user = q('SELECT * FROM users WHERE id = ?').get(Number(result.lastInsertRowid))
       res.status(201).json({ user: publicUser(user), temporaryPassword })
     } catch (error) {
@@ -199,17 +270,30 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
     const target = q('SELECT * FROM users WHERE id = ?').get(toId(req.params.id))
     if (!target) throw new HttpError(404, '사용자를 찾을 수 없습니다.')
     const body = req.body ?? {}
+    const parsedDepartments = Array.isArray(body.departments) ? body.departments : (body.department ? [body.department] : parseList(target.departments))
+    const parsedPositions = Array.isArray(body.positions) ? body.positions : (body.position ? [body.position] : parseList(target.positions))
+    const nextEmailValue = body.email === undefined ? (target.email ?? '') : String(body.email ?? '').trim()
+    const nextEmail = nextEmailValue ? validateEmail(nextEmailValue) : null
+    const nextPhoneValue = body.phone === undefined ? (target.phone ?? '') : String(body.phone ?? '').trim()
+    const nextPhone = nextPhoneValue ? validatePhone(nextPhoneValue) : null
     const next = {
       name: body.name === undefined ? target.name : cleanText(body.name, '이름', { min: 1, max: 30 }),
-      department: body.department ?? target.department,
-      position: body.position ?? target.position,
+      email: nextEmail,
+      phone: nextPhone ?? '',
+      department: parsedDepartments[0] ?? target.department,
+      position: parsedPositions[0] ?? target.position,
+      departments: parsedDepartments.length ? parsedDepartments : [target.department],
+      positions: parsedPositions.length ? parsedPositions : [target.position],
       active: body.active === undefined ? Boolean(target.active) : body.active === true,
     }
     if (body.active !== undefined && typeof body.active !== 'boolean') throw new HttpError(400, '상태 값이 올바르지 않습니다.')
     validateRole(next.department, next.position)
 
     const roleChanged =
-      next.department !== target.department || next.position !== target.position || next.active !== Boolean(target.active)
+      next.department !== target.department || next.position !== target.position ||
+      JSON.stringify(next.departments) !== JSON.stringify(parseList(target.departments)) ||
+      JSON.stringify(next.positions) !== JSON.stringify(parseList(target.positions)) ||
+      next.active !== Boolean(target.active)
     if (roleChanged && target.id === req.user.id) {
       throw new HttpError(400, '본인의 소속·직책·사용 상태는 변경할 수 없습니다.')
     }
@@ -217,8 +301,8 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
       throw new HttpError(409, '결재 중인 품의가 있어 소속·직책·사용 상태를 변경할 수 없습니다. 결재가 끝난 뒤 변경해 주세요.')
     }
     try {
-      q('UPDATE users SET name = ?, department = ?, position = ?, active = ? WHERE id = ?')
-        .run(next.name, next.department, next.position, next.active ? 1 : 0, target.id)
+      q('UPDATE users SET name = ?, email = ?, phone = ?, department = ?, position = ?, departments = ?, positions = ?, active = ? WHERE id = ?')
+        .run(next.name, next.email, next.phone || null, next.department, next.position, JSON.stringify(next.departments), JSON.stringify(next.positions), next.active ? 1 : 0, target.id)
     } catch (error) {
       throw translateConflict(error)
     }
@@ -226,10 +310,22 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
     res.json({ user: publicUser(q('SELECT * FROM users WHERE id = ?').get(target.id)) })
   })
 
+  app.delete('/api/users/:id', ...ready, requireAdmin, (req, res) => {
+    const target = q('SELECT * FROM users WHERE id = ?').get(toId(req.params.id))
+    if (!target) throw new HttpError(404, '사용자를 찾을 수 없습니다.')
+    if (target.id === req.user.id) throw new HttpError(400, '본인은 삭제할 수 없습니다.')
+    if (hasPendingSteps(target.id)) {
+      throw new HttpError(409, '결재 중인 품의가 있어 사용자를 삭제할 수 없습니다. 결재가 끝난 뒤 다시 시도해 주세요.')
+    }
+    q('UPDATE users SET active = 0 WHERE id = ?').run(target.id)
+    q('DELETE FROM sessions WHERE user_id = ?').run(target.id)
+    res.json({ ok: true })
+  })
+
   app.post('/api/users/:id/reset-password', ...ready, requireAdmin, smallJson, async (req, res) => {
     const target = q('SELECT * FROM users WHERE id = ?').get(toId(req.params.id))
     if (!target) throw new HttpError(404, '사용자를 찾을 수 없습니다.')
-    const temporaryPassword = generateTemporaryPassword()
+    const temporaryPassword = ADMIN_RESET_PASSWORD
     q('UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = ?')
       .run(await hashPassword(temporaryPassword), target.id)
     q('DELETE FROM sessions WHERE user_id = ?').run(target.id)
@@ -378,23 +474,31 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
   })
 
   app.get('/api/approval-preview', ...ready, (req, res) => {
-    const steps = buildSteps(db, req.user)
+    const targetDepartment = typeof req.query.department === 'string' && req.query.department.trim()
+      ? cleanText(req.query.department, '기안 대상 소속', { min: 1, max: 50 })
+      : req.user.department
+    validateTargetDepartment(targetDepartment)
+    const steps = buildSteps(db, { ...req.user, department: targetDepartment })
     res.json({ steps: steps.map(({ userId: _userId, status: _status, ...rest }) => rest) })
   })
 
   app.post('/api/requests', ...ready, bigJson, (req, res) => {
     const body = req.body ?? {}
     const fields = validateRequestFields(body)
+    const targetDepartment = typeof body.department === 'string' && body.department.trim()
+      ? cleanText(body.department, '기안 대상 소속', { min: 1, max: 50 })
+      : req.user.department
+    validateTargetDepartment(targetDepartment)
     const images = readNewImages(body, 0)
     const created = transaction(db, () => {
-      const steps = buildSteps(db, req.user)
+      const steps = buildSteps(db, { ...req.user, department: targetDepartment })
       const year = today().slice(0, 4)
       const count = q('SELECT COUNT(*) AS n FROM requests WHERE code LIKE ?').get(`EXP-${year}-%`).n
       const code = `EXP-${year}-${String(count + 1).padStart(3, '0')}`
       const result = q(
         `INSERT INTO requests (code, title, category, amount, memo, requester_id, department, requested_on)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).run(code, fields.title, fields.category, fields.amount, fields.memo, req.user.id, req.user.department, today())
+      ).run(code, fields.title, fields.category, fields.amount, fields.memo, req.user.id, targetDepartment, today())
       const id = Number(result.lastInsertRowid)
       insertSteps(id, steps)
       insertImages(id, images)
@@ -413,6 +517,10 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
 
     const body = req.body ?? {}
     const fields = validateRequestFields(body)
+    const targetDepartment = typeof body.department === 'string' && body.department.trim()
+      ? cleanText(body.department, '기안 대상 소속', { min: 1, max: 50 })
+      : req.user.department
+    validateTargetDepartment(targetDepartment)
     const keepIds = Array.isArray(body.keepAttachmentIds) ? body.keepAttachmentIds : []
     const existing = new Set(current.attachments.map((item) => item.id))
     if (!keepIds.every((id) => existing.has(id))) throw new HttpError(400, '유지할 첨부 이미지가 올바르지 않습니다.')
@@ -420,11 +528,11 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
     const images = readNewImages(body, keep.size)
 
     transaction(db, () => {
-      const steps = buildSteps(db, req.user)
+      const steps = buildSteps(db, { ...req.user, department: targetDepartment })
       q(
         `UPDATE requests SET title = ?, category = ?, amount = ?, memo = ?, department = ?, requested_on = ?,
            rejection_by = NULL, rejection_reason = NULL, rejection_on = NULL WHERE id = ?`,
-      ).run(fields.title, fields.category, fields.amount, fields.memo, req.user.department, today(), row.id)
+      ).run(fields.title, fields.category, fields.amount, fields.memo, targetDepartment, today(), row.id)
       q('DELETE FROM request_steps WHERE request_id = ?').run(row.id)
       insertSteps(row.id, steps)
       for (const item of current.attachments) {
@@ -449,12 +557,15 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
       const decided = body.action === 'approve' ? '승인' : '반려'
       q('UPDATE request_steps SET status = ?, decided_on = ? WHERE id = ?').run(decided, today(), step.id)
       if (decided === '승인') {
-        q("UPDATE request_steps SET status = '결재 중' WHERE request_id = ? AND seq = ?").run(row.id, step.seq + 1)
+        const nextStep = q('SELECT * FROM request_steps WHERE request_id = ? AND seq = ?').get(row.id, step.seq + 1)
+        if (nextStep) {
+          q("UPDATE request_steps SET status = '결재 중' WHERE id = ?").run(nextStep.id)
+        }
       } else {
         q('UPDATE requests SET rejection_by = ?, rejection_reason = ?, rejection_on = ? WHERE id = ?')
           .run(req.user.name, reason, today(), row.id)
       }
-      const action = decided === '반려' ? '반려' : step.kind === '지출 처리' ? '지출 완료' : '승인'
+      const action = decided === '반려' ? '반려' : step.kind === '교장 결재' ? '승인' : '승인'
       logEvent(row.id, req.user.id, action, reason)
     })
     res.json({ request: serialize(q('SELECT * FROM requests WHERE id = ?').get(row.id)) })

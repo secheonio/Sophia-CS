@@ -31,14 +31,10 @@ export function newSessionToken() {
   return crypto.randomBytes(32).toString('base64url')
 }
 
-const TEMP_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789'
+export const DEFAULT_TEMP_PASSWORD = 'sophia00'
 
 export function generateTemporaryPassword() {
-  let password = ''
-  for (let index = 0; index < 12; index += 1) {
-    password += TEMP_ALPHABET[crypto.randomInt(TEMP_ALPHABET.length)]
-  }
-  return password
+  return DEFAULT_TEMP_PASSWORD
 }
 
 export function readCookie(req, name) {
@@ -54,9 +50,9 @@ export function readCookie(req, name) {
 }
 
 const WINDOW_MS = 10 * 60 * 1000
-const LIMITS = { e: 5, i: 30 }
+const LIMITS = { e: 5, n: 5, i: 30 }
 
-// 무차별 대입 방지: 이메일당 5회, IP당 30회 실패 시 10분간 차단합니다.
+// 무차별 대입 방지: 이름/이메일당 5회, IP당 30회 실패 시 10분간 차단합니다.
 export function createLoginLimiter() {
   const failures = new Map()
 

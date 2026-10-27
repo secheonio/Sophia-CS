@@ -4,7 +4,38 @@ import type { ApprovalStep, ExpenseRequest, Meta, NewImage, RequestStatus, User 
 
 type FilterStatus = '전체' | RequestStatus
 const filters: FilterStatus[] = ['전체', '결재 중', '지출 대기', '지출 완료', '반려']
-const emptyForm = { title: '', category: '', amount: '', memo: '' }
+const launchDepartments = ['기초과정', '본과정', '심화과정', '생활관', '전형위원회', '교무부', '교육과정연구부', '생활교육부', '델포이', '행정실']
+const launchDepartmentTones: Record<string, 'course' | 'institution' | 'department' | 'accounting'> = {
+  기초과정: 'course',
+  본과정: 'course',
+  심화과정: 'course',
+  생활관: 'institution',
+  전형위원회: 'institution',
+  교무부: 'department',
+  교육과정연구부: 'department',
+  생활교육부: 'department',
+  델포이: 'institution',
+  행정실: 'accounting',
+}
+
+type BudgetRow = {
+  관: string
+  항: string
+  목: string
+  세목: string
+  내역: string
+  예산총액: number
+  예산잔액: number
+  집행률: number
+}
+
+const emptyForm = { title: '', category: '', amount: '', memo: '', department: '', budgetGwan: '', budgetHang: '', budgetMok: '', budgetSemok: '', budgetNae: '' }
+
+function pickDefaultDepartment(user: User, departments: string[]) {
+  const validCurrent = user.department && departments.includes(user.department) && user.department !== '교장' && user.department !== '행정실'
+  if (validCurrent) return user.department
+  return departments.find((department) => department !== '교장' && department !== '행정실') ?? departments[0]
+}
 
 interface DraftImage { key: string; name: string; src: string; attachmentId?: number; dataUrl?: string }
 
@@ -12,7 +43,13 @@ const formatCurrency = (amount: number) => new Intl.NumberFormat('ko-KR').format
 const slug = (value: string) => value.replaceAll(' ', '-')
 
 function stepStateLabel(step: { status: string; kind: string; date?: string | null }) {
-  const label = step.status === '승인' && step.kind === '지출 처리' ? '지출 완료' : step.status
+  const isFinalizedPayment = step.status === '승인' && (
+    step.kind === '교장 결재, 지출처리 요청' ||
+    step.kind === '교장 결재 대기중' ||
+    step.kind === '행정실장 지출처리' ||
+    step.kind === '행정실장 경유'
+  )
+  const label = isFinalizedPayment ? '지출 완료' : step.status
   return step.date ? `${label} · ${step.date}` : label
 }
 
@@ -47,8 +84,11 @@ export function Requests({ user, meta, inboxOnly, onWaitingCount, notify, onErro
   const [departmentFilter, setDepartmentFilter] = useState('전체 부서')
   const [isFormOpen, setIsFormOpen] = useState(false)
   const [editingId, setEditingId] = useState<number | null>(null)
-  const [form, setForm] = useState({ ...emptyForm, category: meta.categories[0] })
+  const [form, setForm] = useState({ ...emptyForm, category: meta.categories[0], department: pickDefaultDepartment(user, meta.departments) })
+  const [selectedBudget, setSelectedBudget] = useState<BudgetRow | null>(null)
   const [images, setImages] = useState<DraftImage[]>([])
+  const budgetCatalog = meta.budgetCatalog ?? {}
+  const budgetRows = form.department ? (budgetCatalog[form.department] ?? []) : []
   const [formError, setFormError] = useState('')
   const [preview, setPreview] = useState<ApprovalStep[]>([])
   const [previewError, setPreviewError] = useState('')
@@ -107,20 +147,43 @@ export function Requests({ user, meta, inboxOnly, onWaitingCount, notify, onErro
     setRejectReason('')
   }
 
-  async function openForm(request?: ExpenseRequest) {
+  async function openForm(request?: ExpenseRequest, preferredDepartment?: string) {
     setFormError('')
     setPreviewError('')
     setEditingId(request?.id ?? null)
+    const nextDepartment = request?.department || preferredDepartment || pickDefaultDepartment(user, meta.departments)
+    const initialBudget = budgetCatalog[nextDepartment]?.[0] ?? null
+    setSelectedBudget(initialBudget)
     setForm(request
-      ? { title: request.title, category: request.category, amount: String(request.amount), memo: request.memo }
-      : { ...emptyForm, category: meta.categories[0] })
+      ? {
+          title: request.title,
+          category: request.category,
+          amount: String(request.amount),
+          memo: request.memo,
+          department: nextDepartment,
+          budgetGwan: initialBudget?.관 ?? '',
+          budgetHang: initialBudget?.항 ?? '',
+          budgetMok: initialBudget?.목 ?? '',
+          budgetSemok: initialBudget?.세목 ?? '',
+          budgetNae: initialBudget?.내역 ?? '',
+        }
+      : {
+          ...emptyForm,
+          category: meta.categories[0],
+          department: nextDepartment,
+          budgetGwan: initialBudget?.관 ?? '',
+          budgetHang: initialBudget?.항 ?? '',
+          budgetMok: initialBudget?.목 ?? '',
+          budgetSemok: initialBudget?.세목 ?? '',
+          budgetNae: initialBudget?.내역 ?? '',
+        })
     setImages(request
       ? request.attachments.map((item) => ({ key: `a${item.id}`, name: item.name, src: attachmentUrl(item.id), attachmentId: item.id }))
       : [])
     setPreview([])
     setIsFormOpen(true)
     try {
-      setPreview((await api.preview()).steps)
+      setPreview((await api.preview(nextDepartment)).steps)
     } catch (caught) {
       setPreviewError(caught instanceof ApiError ? caught.message : '결재선을 확인하지 못했습니다.')
     }
@@ -129,6 +192,40 @@ export function Requests({ user, meta, inboxOnly, onWaitingCount, notify, onErro
   function updateForm(event: ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) {
     const { name, value } = event.currentTarget
     setForm((current) => ({ ...current, [name]: value }))
+    if (name === 'department' && value) {
+      const nextRows = budgetCatalog[value] ?? []
+      const nextSelection = nextRows[0] ?? null
+      setSelectedBudget(nextSelection)
+      setForm((current) => ({
+        ...current,
+        budgetGwan: nextSelection?.관 ?? '',
+        budgetHang: nextSelection?.항 ?? '',
+        budgetMok: nextSelection?.목 ?? '',
+        budgetSemok: nextSelection?.세목 ?? '',
+        budgetNae: nextSelection?.내역 ?? '',
+      }))
+      void (async () => {
+        setPreview([])
+        setPreviewError('')
+        try {
+          setPreview((await api.preview(value)).steps)
+        } catch (caught) {
+          setPreviewError(caught instanceof ApiError ? caught.message : '결재선을 확인하지 못했습니다.')
+        }
+      })()
+    }
+  }
+
+  function pickBudgetRow(row: BudgetRow) {
+    setSelectedBudget(row)
+    setForm((current) => ({
+      ...current,
+      budgetGwan: row.관,
+      budgetHang: row.항,
+      budgetMok: row.목,
+      budgetSemok: row.세목,
+      budgetNae: row.내역,
+    }))
   }
 
   async function addImages(event: ChangeEvent<HTMLInputElement>) {
@@ -166,6 +263,14 @@ export function Requests({ user, meta, inboxOnly, onWaitingCount, notify, onErro
       category: form.category,
       amount,
       memo: form.memo.trim(),
+      department: form.department || user.department || meta.departments[0],
+      budget: {
+        관: form.budgetGwan.trim(),
+        항: form.budgetHang.trim(),
+        목: form.budgetMok.trim(),
+        세목: form.budgetSemok.trim(),
+        내역: form.budgetNae.trim(),
+      },
       newAttachments: images.filter((image) => image.dataUrl).map<NewImage>((image) => ({ name: image.name, dataUrl: image.dataUrl! })),
       keepAttachmentIds: images.flatMap((image) => (image.attachmentId ? [image.attachmentId] : [])),
     }
@@ -194,7 +299,9 @@ export function Requests({ user, meta, inboxOnly, onWaitingCount, notify, onErro
       setRejectReason('')
       notify(action === 'reject'
         ? '반려했습니다. 기안자가 수정 후 다시 상신할 수 있습니다.'
-        : currentStep.kind === '지출 처리' ? '지출 처리를 완료했습니다.' : '결재를 승인했습니다.')
+        : currentStep.kind === '교장 결재, 지출처리 요청' || currentStep.kind === '교장 결재 대기중' || currentStep.kind === '행정실장 지출처리'
+          ? '지출 처리를 완료했습니다.'
+          : '결재를 승인했습니다.')
     } catch (caught) {
       onError(caught instanceof ApiError ? caught.message : '처리하지 못했습니다.')
     } finally {
@@ -211,10 +318,24 @@ export function Requests({ user, meta, inboxOnly, onWaitingCount, notify, onErro
           <h1>{inboxOnly ? '내 결재함' : '지출품의'}</h1>
           <p>{inboxOnly
             ? '내가 지금 결재하거나 지출 처리할 차례인 품의입니다.'
-            : '기안 → 기관장 확인 → 교장 결재 → 행정실장 지출 처리까지 한곳에서 관리하세요.'}</p>
+            : '상신 단위를 선택해 바로 기안을 시작하세요.'}</p>
         </div>
-        <button className="primary-button" type="button" onClick={() => void openForm()}><span className="plus">＋</span> 새 지출품의</button>
       </div>
+
+      {!inboxOnly && (
+        <div className="department-launch-grid" aria-label="상신 단위 선택">
+          {launchDepartments.map((department) => (
+            <button
+              key={department}
+              type="button"
+              className={`department-launch-button department-launch-${launchDepartmentTones[department]}`}
+              onClick={() => void openForm(undefined, department)}
+            >
+              {department}
+            </button>
+          ))}
+        </div>
+      )}
 
       <section className="summary-grid" aria-label="지출품의 요약">
         <article className="summary-card"><div className="summary-top"><span>내 처리 대기</span><span className="summary-icon icon-yellow">◷</span></div><strong className="summary-value">{waitingCount}<small>건</small></strong><span className="summary-foot">내가 결재하거나 지출 처리할 요청</span></article>
@@ -281,7 +402,7 @@ export function Requests({ user, meta, inboxOnly, onWaitingCount, notify, onErro
               <div className="decision-actions">
                 <button className="reject-button" type="button" disabled={busy} onClick={() => setIsRejecting(true)}>반려</button>
                 <button className="approve-button" type="button" disabled={busy} onClick={() => void decide('approve')}>
-                  {currentStep.kind === '지출 처리' ? '지출 완료 처리' : '승인하기'} <span>→</span>
+                  {currentStep.kind === '교장 결재, 지출처리 요청' || currentStep.kind === '교장 결재 대기중' || currentStep.kind === '행정실장 지출처리' ? '지출 완료 처리' : '승인하기'} <span>→</span>
                 </button>
               </div>
             )}
@@ -362,9 +483,60 @@ export function Requests({ user, meta, inboxOnly, onWaitingCount, notify, onErro
               <button className="modal-close" type="button" aria-label="닫기" onClick={() => setIsFormOpen(false)}>×</button>
             </div>
             <form onSubmit={(event) => void submit(event)}>
+              <div className="approval-form-section">
+                <div className="form-section-heading"><span>예산 항목 선택</span><small>클릭한 행의 관·항·목·세목·내역이 자동 입력됩니다.</small></div>
+                {form.department && budgetRows.length > 0 && (
+                  <div className="budget-table-wrap">
+                    <table className="budget-table">
+                      <thead>
+                        <tr>
+                          <th>관</th>
+                          <th>항</th>
+                          <th>목</th>
+                          <th>세목</th>
+                          <th>내역</th>
+                          <th>예산 총액</th>
+                          <th>예산 잔액</th>
+                          <th>집행률</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {budgetRows.map((row) => {
+                          const isSelected = selectedBudget === row || (
+                            !selectedBudget &&
+                            row.관 === form.budgetGwan &&
+                            row.항 === form.budgetHang &&
+                            row.목 === form.budgetMok &&
+                            row.세목 === form.budgetSemok &&
+                            row.내역 === form.budgetNae
+                          )
+                          const total = Number(row.예산총액 ?? 0)
+                          const balance = Number(row.예산잔액 ?? 0)
+                          const rate = total > 0 ? Math.min(100, Math.max(0, ((total - balance) / total) * 100)) : 0
+                          return (
+                            <tr key={`${row.관}-${row.항}-${row.목}-${row.세목}-${row.내역}`} className={isSelected ? 'selected-budget-row' : ''} onClick={() => pickBudgetRow(row)}>
+                              <td>{row.관}</td>
+                              <td>{row.항}</td>
+                              <td>{row.목}</td>
+                              <td>{row.세목}</td>
+                              <td>{row.내역}</td>
+                              <td>{total.toLocaleString()}</td>
+                              <td>{balance.toLocaleString()}</td>
+                              <td className="budget-rate-cell">{`${rate.toFixed(0)}%`}</td>
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
               <label className="form-field"><span>품의 제목 <i>*</i></span><input name="title" value={form.title} onChange={updateForm} placeholder="예: 현장학습 버스 대절" required maxLength={80} /></label>
               <div className="form-row">
+                <label className="form-field"><span>기안 대상 소속 <i>*</i></span><select name="department" value={form.department || user.department || meta.departments[0]} onChange={updateForm}>{meta.departments.map((department) => <option key={department} value={department}>{department}</option>)}</select></label>
                 <label className="form-field"><span>비용 항목 <i>*</i></span><select name="category" value={form.category} onChange={updateForm}>{meta.categories.map((category) => <option key={category}>{category}</option>)}</select></label>
+              </div>
+              <div className="form-row">
                 <label className="form-field"><span>요청 금액 <i>*</i></span><div className="currency-input"><span>₩</span><input name="amount" type="number" min="1" step="1" value={form.amount} onChange={updateForm} placeholder="0" required /></div></label>
               </div>
               <label className="form-field"><span>사용 목적 및 메모</span><textarea name="memo" value={form.memo} onChange={updateForm} placeholder="지출이 필요한 이유를 입력해 주세요." rows={3} maxLength={500} /></label>
@@ -386,7 +558,7 @@ export function Requests({ user, meta, inboxOnly, onWaitingCount, notify, onErro
                 )}
               </div>
               <div className="approval-form-section">
-                <div className="form-section-heading"><span>결재선 (자동 지정)</span><small>기안자의 부서 기준으로 정해집니다.</small></div>
+                <div className="form-section-heading"><span>결재선 (자동 지정)</span><small>기안 대상 소속을 기준으로 결재선이 정해집니다.</small></div>
                 {previewError ? <p className="form-error" role="alert">{previewError}</p> : (
                   <ol className="preview-steps">
                     {preview.map((step) => <li key={step.kind}><strong>{step.name}</strong> <span>{step.kind} · {step.position}</span></li>)}

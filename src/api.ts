@@ -37,23 +37,33 @@ async function call<T>(method: string, url: string, body?: unknown): Promise<T> 
 
 export const api = {
   me: () => call<{ user: User }>('GET', '/api/me'),
-  login: (email: string, password: string) => call<{ user: User }>('POST', '/api/auth/login', { email, password }),
+  login: (name: string, password: string) => call<{ user: User }>('POST', '/api/auth/login', { name, password }),
   logout: () => call<{ ok: true }>('POST', '/api/auth/logout'),
-  changePassword: (currentPassword: string, newPassword: string) =>
-    call<{ user: User }>('POST', '/api/auth/change-password', { currentPassword, newPassword }),
+  changePassword: (currentPassword: string, newPassword: string, contact?: { email?: string; phone?: string }) =>
+    call<{ user: User }>('POST', '/api/auth/change-password', { currentPassword, newPassword, ...(contact ?? {}) }),
   meta: () => call<Meta>('GET', '/api/meta'),
   requests: () => call<{ requests: ExpenseRequest[] }>('GET', '/api/requests'),
-  preview: () => call<{ steps: ApprovalStep[] }>('GET', '/api/approval-preview'),
+  preview: (department?: string) => call<{ steps: ApprovalStep[] }>('GET', department ? `/api/approval-preview?department=${encodeURIComponent(department)}` : '/api/approval-preview'),
   create: (payload: RequestPayload) => call<{ request: ExpenseRequest }>('POST', '/api/requests', payload),
   resubmit: (id: number, payload: RequestPayload) =>
     call<{ request: ExpenseRequest }>('POST', `/api/requests/${id}/resubmit`, payload),
   decide: (id: number, action: 'approve' | 'reject', reason?: string) =>
     call<{ request: ExpenseRequest }>('POST', `/api/requests/${id}/decision`, { action, reason }),
   users: () => call<{ users: User[] }>('GET', '/api/users'),
-  addUser: (input: { name: string; email: string; department: string; position: string }) =>
-    call<{ user: User; temporaryPassword: string }>('POST', '/api/users', input),
-  updateUser: (id: number, input: Partial<Pick<User, 'name' | 'department' | 'position' | 'active'>>) =>
-    call<{ user: User }>('PATCH', `/api/users/${id}`, input),
+  addUser: (input: {
+    name: string
+    email?: string
+    phone?: string
+    department?: string
+    position?: string
+    departments?: string[]
+    positions?: string[]
+  }) => call<{ user: User; temporaryPassword: string }>('POST', '/api/users', input),
+  updateUser: (id: number, input: Partial<Pick<User, 'name' | 'email' | 'phone' | 'department' | 'position' | 'active'>> & {
+    departments?: string[]
+    positions?: string[]
+  }) => call<{ user: User }>('PATCH', `/api/users/${id}`, input),
+  deleteUser: (id: number) => call<{ ok: true }>('DELETE', `/api/users/${id}`),
   resetPassword: (id: number) => call<{ temporaryPassword: string }>('POST', `/api/users/${id}/reset-password`),
   transferPrincipal: (input: { userId?: number; name?: string; email?: string; confirm: true }) =>
     call<{ user: User; temporaryPassword: string | null; transferredSteps: number }>('POST', '/api/principal/transfer', input),

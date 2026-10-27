@@ -40,9 +40,9 @@ async function addUser(name, email, department, position) {
   ).run(email, name, department, position, hash)
 }
 
-async function login(email, password = PASSWORD) {
+async function login(name, password = PASSWORD) {
   const client = new Client()
-  const result = await client.post('/api/auth/login', { email, password })
+  const result = await client.post('/api/auth/login', { name, password })
   assert.equal(result.status, 200, JSON.stringify(result.json))
   return client
 }
@@ -76,15 +76,15 @@ describe('인증', () => {
   })
 
   test('잘못된 비밀번호와 없는 계정은 같은 오류로 거부한다', async () => {
-    const wrongPassword = await new Client().post('/api/auth/login', { email: 'staff1@test.kr', password: 'wrong-password' })
-    const unknown = await new Client().post('/api/auth/login', { email: 'nobody@test.kr', password: 'wrong-password' })
+    const wrongPassword = await new Client().post('/api/auth/login', { name: '한기안', password: 'wrong-password' })
+    const unknown = await new Client().post('/api/auth/login', { name: '없음', password: 'wrong-password' })
     assert.equal(wrongPassword.status, 401)
     assert.equal(unknown.status, 401)
     assert.equal(wrongPassword.json.error, unknown.json.error)
   })
 
   test('비밀번호 해시는 응답에 노출되지 않는다', async () => {
-    const client = await login('staff1@test.kr')
+    const client = await login('한기안')
     const me = await client.get('/api/me')
     assert.equal(me.json.user.email, 'staff1@test.kr')
     assert.equal(JSON.stringify(me.json).includes('hash'), false)
@@ -93,9 +93,9 @@ describe('인증', () => {
   test('반복 실패하면 정상 비밀번호도 일시 차단한다', async () => {
     const client = new Client()
     for (let attempt = 0; attempt < 5; attempt += 1) {
-      assert.equal((await client.post('/api/auth/login', { email: 'staff3@test.kr', password: 'bad-password' })).status, 401)
+      assert.equal((await client.post('/api/auth/login', { name: '오본과', password: 'bad-password' })).status, 401)
     }
-    assert.equal((await client.post('/api/auth/login', { email: 'staff3@test.kr', password: PASSWORD })).status, 429)
+    assert.equal((await client.post('/api/auth/login', { name: '오본과', password: PASSWORD })).status, 429)
   })
 
   test('JSON이 아니거나 다른 출처의 변경 요청은 거부한다', async () => {
@@ -121,16 +121,36 @@ describe('인증', () => {
     assert.equal((await client.get('/api/me')).json.user.mustChangePassword, false)
     assert.equal((await client.get('/api/meta')).status, 200)
   })
+
+  test('이메일과 전화번호는 비밀번호 없이도 수정할 수 있다', async () => {
+    const name = '자기정보수정'
+    const email = 'self-edit@test.kr'
+    await addUser(name, email, '생활관', '기안자')
+    const client = await login(name)
+    const updated = await client.post('/api/auth/change-password', {
+      currentPassword: PASSWORD,
+      newPassword: '',
+      email: 'update-self-edit@test.kr',
+      phone: '010-1111-2222',
+    })
+    assert.equal(updated.status, 200)
+    assert.equal(updated.json.user.email, 'update-self-edit@test.kr')
+    assert.equal(updated.json.user.phone, '010-1111-2222')
+    assert.equal(updated.json.user.mustChangePassword, false)
+  })
 })
 
 describe('결재 흐름', () => {
-  test('기안 → 기관장 → 교장 → 행정실장 순서로만 진행되고 지출 완료가 된다', async () => {
+  test('기안 → 소속장 → 행정실장(교장 결재 대기중) → 교장 → 행정실장 지출처리 순서로 진행되고 지출 완료가 된다', async () => {
     const staff = await login('staff1@test.kr')
     const created = await staff.post('/api/requests', draft({ newAttachments: [{ name: '영수증.png', dataUrl: PNG }] }))
     assert.equal(created.status, 201)
     const request = created.json.request
     assert.deepEqual(request.steps.map((step) => `${step.name}:${step.kind}:${step.status}`), [
-      '김기초:확인 결재:결재 중', '이교장:최종 결재:대기', '박행정:지출 처리:대기',
+      '김기초:소속장 결재:결재 중',
+      '박행정:교장 결재 대기중:대기',
+      '이교장:교장 결재:대기',
+      '박행정:행정실장 지출처리:대기',
     ])
     assert.equal(request.attachments.length, 1)
 
@@ -140,21 +160,37 @@ describe('결재 흐름', () => {
     const url = `/api/requests/${request.id}/decision`
 
     assert.equal((await principal.post(url, { action: 'approve' })).status, 403)
-    assert.equal((await accountant.post(url, { action: 'approve' })).status, 403)
     assert.equal((await staff.post(url, { action: 'approve' })).status, 403)
-
     assert.equal((await head.post(url, { action: 'approve' })).json.request.status, '결재 중')
     assert.equal((await head.post(url, { action: 'approve' })).status, 403)
-    assert.equal((await accountant.post(url, { action: 'approve' })).status, 403)
+    assert.equal((await accountant.post(url, { action: 'approve' })).json.request.status, '결재 중')
     assert.equal((await principal.post(url, { action: 'approve' })).json.request.status, '지출 대기')
     assert.equal((await accountant.post(url, { action: 'approve' })).json.request.status, '지출 완료')
     assert.equal((await accountant.post(url, { action: 'approve' })).status, 403)
   })
 
-  test('행정실장은 기관장 확인 없이 교장에게 바로 상신한다', async () => {
+  test('행정실장은 소속장 확인 없이 교장 결재 대기중 → 교장 결재 → 지출처리 경로로 상신한다', async () => {
     const accountant = await login('admin@test.kr')
     const { request } = (await accountant.post('/api/requests', draft())).json
-    assert.deepEqual(request.steps.map((step) => `${step.name}:${step.kind}`), ['이교장:최종 결재', '박행정:지출 처리'])
+    assert.deepEqual(request.steps.map((step) => `${step.name}:${step.kind}`), [
+      '박행정:교장 결재 대기중',
+      '이교장:교장 결재',
+      '박행정:행정실장 지출처리',
+    ])
+  })
+
+  test('교장도 선택한 소속을 기안 대상으로 지정하면 소속장 → 교장 결재 대기중 → 교장 → 행정실장 지출처리 순서로 상신된다', async () => {
+    const principal = await login('이교장')
+    const created = await principal.post('/api/requests', draft({ department: '기초과정' }))
+    assert.equal(created.status, 201)
+    assert.equal(created.json.request.department, '기초과정')
+    assert.equal(created.json.request.requester, '이교장')
+    assert.deepEqual(created.json.request.steps.map((step) => `${step.name}:${step.kind}:${step.status}`), [
+      '김기초:소속장 결재:결재 중',
+      '박행정:교장 결재 대기중:대기',
+      '이교장:교장 결재:대기',
+      '박행정:행정실장 지출처리:대기',
+    ])
   })
 
   test('반려는 사유가 필수이고 재상신하면 결재선이 처음부터 다시 시작된다', async () => {
@@ -185,7 +221,7 @@ describe('결재 흐름', () => {
     assert.equal((await staff.post(`/api/requests/${request.id}/resubmit`, draft())).status, 409)
   })
 
-  test('기관장이 지정되지 않은 부서의 기안은 거부한다', async () => {
+  test('소속장이 지정되지 않은 부서의 기안은 거부한다', async () => {
     const staff = await login('staff3@test.kr', PASSWORD).catch(() => null)
     const user = staff ?? new Client()
     // 앞선 테스트의 로그인 차단과 무관하게 세션을 직접 만든다.
@@ -194,7 +230,7 @@ describe('결재 흐름', () => {
     user.cookie = 'sid=manual-token'
     const result = await user.post('/api/requests', draft())
     assert.equal(result.status, 409)
-    assert.match(result.json.error, /기관장/)
+    assert.match(result.json.error, /소속장/)
   })
 
   test('입력값을 서버에서 검증한다', async () => {
@@ -262,6 +298,7 @@ const transferTests = () => describe('교장 교체', () => {
     const done = (await staff.post('/api/requests', draft({ title: '교체 전 완료' }))).json.request
     await head2.post(`/api/requests/${waiting.id}/decision`, { action: 'approve' })
     await head2.post(`/api/requests/${done.id}/decision`, { action: 'approve' })
+    await accountant.post(`/api/requests/${done.id}/decision`, { action: 'approve' })
     await principal.post(`/api/requests/${done.id}/decision`, { action: 'approve' })
     await accountant.post(`/api/requests/${done.id}/decision`, { action: 'approve' })
 
@@ -280,10 +317,10 @@ const transferTests = () => describe('교장 교체', () => {
     const list = (await next.get('/api/requests')).json.requests
     assert.ok(list.some((item) => item.title === '교체 전 완료'))
     const moved = list.find((item) => item.id === waiting.id)
-    assert.equal(moved.steps[1].name, '새교장')
-    assert.equal((await next.post(`/api/requests/${waiting.id}/decision`, { action: 'approve' })).json.request.status, '지출 대기')
+    assert.equal(moved.steps[2].name, '새교장')
+    assert.equal((await next.post(`/api/requests/${waiting.id}/decision`, { action: 'approve' })).status, 403)
     const finished = list.find((item) => item.id === done.id)
-    assert.equal(finished.steps[1].name, '이교장')
+    assert.equal(finished.steps[2].name, '이교장')
     assert.equal((await next.get('/api/users')).status, 200)
   })
 
@@ -317,7 +354,7 @@ describe('사용자 관리', () => {
     assert.equal(created.status, 201)
     assert.equal(created.json.user.email, 'fresh@test.kr')
     assert.equal(created.json.user.mustChangePassword, true)
-    assert.ok(created.json.temporaryPassword.length >= 12)
+    assert.equal(created.json.temporaryPassword, 'sophia00')
 
     const fresh = await login('fresh@test.kr', created.json.temporaryPassword)
     assert.equal((await fresh.get('/api/requests')).status, 403)
@@ -326,7 +363,22 @@ describe('사용자 관리', () => {
     assert.equal(duplicate.status, 409)
   })
 
-  test('직책 규칙을 지킨다: 교장·행정실장 1명, 부서당 기관장 1명, 행정실은 행정실장만', async () => {
+  test('이메일 없이 이름만으로도 사용자를 추가할 수 있다', async () => {
+    const principal = await login('principal@test.kr')
+    const created = await principal.post('/api/users', {
+      name: '이름만신규',
+      department: '기초과정',
+      position: '기안자',
+      departments: ['기초과정'],
+      positions: ['기안자'],
+    })
+    assert.equal(created.status, 201, JSON.stringify(created.json))
+    assert.equal(created.json.user.name, '이름만신규')
+    assert.equal(created.json.user.email, '')
+    assert.equal(created.json.temporaryPassword, 'sophia00')
+  })
+
+  test('직책 규칙을 지킨다: 교장·행정실장 1명, 소속당 소속장 1명, 행정실은 행정실장만', async () => {
     const principal = await login('principal@test.kr')
     const add = (department, position, email) => principal.post('/api/users', { name: '시험', email, department, position })
     assert.equal((await add('교장', '교장', 'p2@test.kr')).status, 409)
@@ -363,10 +415,36 @@ describe('사용자 관리', () => {
     const id = (await principal.get('/api/users')).json.users.find((user) => user.email === 'staff2@test.kr').id
     const reset = await principal.post(`/api/users/${id}/reset-password`)
     assert.equal(reset.status, 200)
+    assert.equal(reset.json.temporaryPassword, 'sophia00')
     assert.equal((await staff.get('/api/me')).status, 401)
     assert.equal((await new Client().post('/api/auth/login', { email: 'staff2@test.kr', password: PASSWORD })).status, 401)
     const again = await login('staff2@test.kr', reset.json.temporaryPassword)
     assert.equal((await again.get('/api/me')).json.user.mustChangePassword, true)
+  })
+
+  test('다중 소속·직책 값이 서버에 저장되고 복원된다', async () => {
+    const principal = await login('principal@test.kr')
+    const created = await principal.post('/api/users', {
+      name: '다중사용자',
+      email: 'multi@test.kr',
+      department: '기초과정',
+      position: '기안자',
+      departments: ['기초과정', '본과정', '생활관'],
+      positions: ['기안자', '기관장'],
+    })
+    assert.equal(created.status, 201)
+    assert.deepEqual(created.json.user.departments, ['기초과정', '본과정', '생활관'])
+    assert.deepEqual(created.json.user.positions, ['기안자', '기관장'])
+
+    const updated = await principal.patch(`/api/users/${created.json.user.id}`, {
+      department: '본과정',
+      position: '기관장',
+      departments: ['본과정', '생활관'],
+      positions: ['기관장', '기안자'],
+    })
+    assert.equal(updated.status, 200)
+    assert.deepEqual(updated.json.user.departments, ['본과정', '생활관'])
+    assert.deepEqual(updated.json.user.positions, ['기관장', '기안자'])
   })
 })
 

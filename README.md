@@ -38,10 +38,24 @@
 
 ```powershell
 npm install
-npm run create-admin -- "교장 이름" principal@school.kr   # 최초 1회
-npm run dev:server    # API 서버 (http://127.0.0.1:3001)
-npm run dev           # 화면 (http://127.0.0.1:5173, /api는 3001로 전달)
+$env:PORT = '3002'; $env:HOST = '127.0.0.1'; node server/index.js   # 로컬 API 서버 (http://127.0.0.1:3002)
+npm run dev                                                       # 화면 (http://127.0.0.1:3100, /api는 3002로 전달)
 ```
+
+- 로컬 개발 환경에서는 학교 Ubuntu SSH 터널이 3001 포트를 점유할 수 있으므로, 로컬 API는 3002를 기본으로 둡니다.
+- 실제 운영 배포는 3001 또는 프록시 뒤의 공개 포트를 사용합니다.
+- 교장(관리자) 로그인은 학교 초기 관리자 계정으로 진행하고, 사용자 추가 화면에서 다중 소속/다중 직책을 선택해 저장할 수 있습니다.
+
+### 로컬 배포 전 점검
+
+```powershell
+node --test server/app.test.js
+node_modules\typescript\bin\tsc -b
+node_modules\vite\bin\vite.js build
+```
+
+- 로그인/권한/결재 흐름/관리자 기능을 검증한 뒤 운영 서버로 옮깁니다.
+- 학교 서버에 배포할 때는 HTTPS 뒤에서만 운영하고, 쿠키는 `secure` 모드로 동작하도록 설정합니다.
 
 ## 실행 (운영)
 

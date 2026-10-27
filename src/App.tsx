@@ -41,7 +41,7 @@ function App() {
 
   if (booting) return <div className="auth-page"><p>불러오는 중…</p></div>
   if (!user) return <LoginScreen onLogin={setUser} />
-  if (user.mustChangePassword) return <PasswordChange user={user} forced onDone={setUser} />
+  if (user.mustChangePassword) return <PasswordChange user={user} forced onDone={setUser} onLogout={logout} />
 
   const isAdmin = user.position === '교장'
   const nav = (target: View, icon: string, label: string, count?: number) => (
@@ -76,7 +76,7 @@ function App() {
         <header className="topbar">
           <div className="breadcrumbs"><span>행정</span><span className="crumb-separator">/</span><strong>{view === 'users' ? '사용자·직책' : '지출품의'}</strong></div>
           <div className="topbar-actions">
-            <button className="cancel-button" type="button" onClick={() => setChangingPassword(true)}>비밀번호 변경</button>
+            <button className="cancel-button" type="button" onClick={() => setChangingPassword(true)}>내정보수정</button>
             <button className="cancel-button" type="button" onClick={() => void logout()}>로그아웃</button>
           </div>
         </header>
@@ -96,7 +96,7 @@ function App() {
 
       {changingPassword && (
         <PasswordChange user={user} forced={false} onCancel={() => setChangingPassword(false)}
-          onDone={(next) => { setUser(next); setChangingPassword(false); notify('비밀번호를 변경했습니다.') }} />
+          onDone={(next) => { setUser(next); setChangingPassword(false); notify('내 정보를 수정했습니다.') }} />
       )}
     </div>
   )
