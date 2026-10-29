@@ -32,6 +32,25 @@
 - 자동화가 필요하면 환경 변수 `INITIAL_ADMIN_PASSWORD`로 비밀번호를 줄 수 있습니다.
 - 교장 계정이 이미 있으면 실행되지 않습니다. 이후 사용자 추가와 교장 교체는 화면에서 합니다.
 
+## 빠른 실행
+
+```powershell
+cd D:\Sophia_Check_System
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+# 서버 시작
+./start-server.ps1
+
+# 서버 종료
+./stop-server.ps1
+
+# 서버 재시작
+./restart-server.ps1
+
+# 프론트엔드 시작
+npm run dev -- --host 127.0.0.1 --port 3100
+```
+
 ## 실행 (개발)
 
 필요한 것: Node.js 22.13+ (개발은 24에서 확인)
@@ -45,6 +64,59 @@ npm run dev                                                       # 화면 (http
 - 로컬 개발 환경에서는 학교 Ubuntu SSH 터널이 3001 포트를 점유할 수 있으므로, 로컬 API는 3002를 기본으로 둡니다.
 - 실제 운영 배포는 3001 또는 프록시 뒤의 공개 포트를 사용합니다.
 - 교장(관리자) 로그인은 학교 초기 관리자 계정으로 진행하고, 사용자 추가 화면에서 다중 소속/다중 직책을 선택해 저장할 수 있습니다.
+
+### 실행/종료/재시작
+
+#### 실행 명령 모음
+```powershell
+cd D:\Sophia_Check_System
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+# 서버 시작
+./start-server.ps1
+
+# 서버 종료
+./stop-server.ps1
+
+# 서버 재시작
+./restart-server.ps1
+
+# 프론트엔드 시작
+npm run dev -- --host 127.0.0.1 --port 3100
+```
+
+#### 백엔드 서버 종료
+```powershell
+PS D:\Sophia_Check_System> node server/index.js
+지출품의 서버: http://127.0.0.1:3002
+^C
+```
+
+실행 중인 서버 창에서 `Ctrl + C`를 누르면 종료됩니다.
+
+#### 백엔드 서버 재시작
+```powershell
+cd D:\Sophia_Check_System
+node server/index.js
+```
+
+포트가 이미 사용 중이면 아래로 확인해 강제 종료합니다.
+
+```powershell
+Get-NetTCPConnection -LocalPort 3002 -ErrorAction SilentlyContinue
+$procId = (Get-NetTCPConnection -LocalPort 3002 -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty OwningProcess)
+if ($procId) { Stop-Process -Id $procId -Force }
+```
+
+`PID`는 PowerShell의 내장 자동 변수라서 `$pid`처럼 다시 쓰면 에러가 납니다. `$procId` 같은 다른 이름을 쓰고, `<PID>`처럼 꺾쇠 괄호를 그대로 넣지 않아야 합니다.
+
+#### 프론트엔드 재시작
+```powershell
+cd D:\Sophia_Check_System
+npm run dev -- --host 127.0.0.1 --port 3100
+```
+
+문서형 정리: [서버 종료재시작 방법](./docs/서버 종료재시작 방법.md), [로컬 진입 가이드](./docs/로컬에진입.md)
 
 ### 로컬 배포 전 점검
 

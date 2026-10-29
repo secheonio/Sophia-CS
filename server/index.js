@@ -20,31 +20,110 @@ async function purgeCorruptedUsers() {
        OR TRIM(COALESCE(position, '')) = ''
   `).all().map((row) => row.id)
 
-  if (invalidIds.length === 0) {
+  const duplicateIds = db.prepare(`
+    SELECT u.id
+    FROM users u
+    WHERE EXISTS (
+      SELECT 1 FROM users other
+      WHERE other.email = u.email AND other.id != u.id
+    )
+       OR EXISTS (
+      SELECT 1 FROM users other
+      WHERE other.name = u.name AND other.id != u.id AND TRIM(COALESCE(other.name, '')) <> ''
+    )
+  `).all().map((row) => row.id)
+
+  const idsToDelete = [...new Set([...invalidIds, ...duplicateIds])]
+
+  if (idsToDelete.length === 0) {
     return
   }
 
-  const placeholders = invalidIds.map(() => '?').join(', ')
+  const placeholders = idsToDelete.map(() => '?').join(', ')
 
   db.exec('PRAGMA foreign_keys = OFF')
   try {
-    db.prepare(`DELETE FROM request_steps WHERE user_id IN (${placeholders})`).run(...invalidIds)
-    db.prepare(`DELETE FROM request_events WHERE actor_id IN (${placeholders})`).run(...invalidIds)
+    db.prepare(`DELETE FROM request_steps WHERE user_id IN (${placeholders})`).run(...idsToDelete)
+    db.prepare(`DELETE FROM request_events WHERE actor_id IN (${placeholders})`).run(...idsToDelete)
 
-    const requestIds = db.prepare(`SELECT id FROM requests WHERE requester_id IN (${placeholders})`).all(...invalidIds).map((row) => row.id)
+    const requestIds = db.prepare(`SELECT id FROM requests WHERE requester_id IN (${placeholders})`).all(...idsToDelete).map((row) => row.id)
     if (requestIds.length > 0) {
       const requestPlaceholders = requestIds.map(() => '?').join(', ')
       db.prepare(`DELETE FROM request_steps WHERE request_id IN (${requestPlaceholders})`).run(...requestIds)
       db.prepare(`DELETE FROM request_events WHERE request_id IN (${requestPlaceholders})`).run(...requestIds)
       db.prepare(`DELETE FROM attachments WHERE request_id IN (${requestPlaceholders})`).run(...requestIds)
-      db.prepare(`DELETE FROM requests WHERE requester_id IN (${placeholders})`).run(...invalidIds)
+      db.prepare(`DELETE FROM requests WHERE requester_id IN (${placeholders})`).run(...idsToDelete)
     }
 
-    db.prepare(`DELETE FROM sessions WHERE user_id IN (${placeholders})`).run(...invalidIds)
-    db.prepare(`DELETE FROM users WHERE id IN (${placeholders})`).run(...invalidIds)
-    console.log(`오염된 사용자 데이터 ${invalidIds.length}건을 정리했습니다.`)
+    db.prepare(`DELETE FROM sessions WHERE user_id IN (${placeholders})`).run(...idsToDelete)
+    db.prepare(`DELETE FROM users WHERE id IN (${placeholders})`).run(...idsToDelete)
+    console.log(`오염된 사용자 데이터 ${idsToDelete.length}건을 정리했습니다.`)
   } finally {
     db.exec('PRAGMA foreign_keys = ON')
+  }
+}
+
+function ensureSingleActiveRoleForDepartment(department, position, preferredId = null) {
+  const rows = db.prepare(`
+    SELECT id, email, name
+    FROM users
+    WHERE department = ? AND position = ? AND active = 1
+    ORDER BY id
+  `).all(department, position)
+
+  if (rows.length <= 1) {
+    return
+  }
+
+  const keepId = preferredId != null
+    ? rows.find((row) => row.id === preferredId)?.id ?? rows[0].id
+    : rows[0].id
+
+  for (const row of rows) {
+    if (row.id !== keepId) {
+      db.prepare('UPDATE users SET active = 0 WHERE id = ?').run(row.id)
+    }
+  }
+}
+
+function cleanDuplicateActiveRoleRows() {
+  const departmentHeadGroups = db.prepare(`
+    SELECT department, MIN(id) AS keep_id
+    FROM users
+    WHERE position = '기관장' AND active = 1
+    GROUP BY department
+    HAVING COUNT(*) > 1
+  `).all()
+
+  for (const group of departmentHeadGroups) {
+    const extraIds = db.prepare(`
+      SELECT id
+      FROM users
+      WHERE department = ? AND position = '기관장' AND active = 1 AND id != ?
+      ORDER BY id
+    `).all(group.department, group.keep_id)
+
+    for (const row of extraIds) {
+      db.prepare('UPDATE users SET active = 0 WHERE id = ?').run(row.id)
+    }
+  }
+
+  const uniqueRoleChecks = [
+    { position: '행정실장', match: "position = '행정실장' AND active = 1" },
+    { position: '교장', match: "position = '교장' AND active = 1" },
+  ]
+
+  for (const check of uniqueRoleChecks) {
+    const rows = db.prepare(`
+      SELECT id
+      FROM users
+      WHERE ${check.match}
+      ORDER BY id
+    `).all()
+
+    for (let index = 1; index < rows.length; index += 1) {
+      db.prepare('UPDATE users SET active = 0 WHERE id = ?').run(rows[index].id)
+    }
   }
 }
 
@@ -89,20 +168,44 @@ async function ensureStablePrincipal() {
   }
 }
 
+function normalizeDuplicateDepartmentHeads() {
+  const duplicates = db.prepare(`
+    SELECT department, MIN(id) AS keep_id
+    FROM users
+    WHERE active = 1 AND position = '기관장'
+    GROUP BY department
+    HAVING COUNT(*) > 1
+  `).all()
+
+  for (const duplicate of duplicates) {
+    const extraIds = db.prepare(`
+      SELECT id
+      FROM users
+      WHERE department = ? AND position = '기관장' AND active = 1 AND id != ?
+      ORDER BY id
+    `).all(duplicate.department, duplicate.keep_id)
+
+    for (const row of extraIds) {
+      db.prepare('UPDATE users SET active = 0 WHERE id = ?').run(row.id)
+    }
+  }
+}
+
 async function ensureSeedUsers() {
   const defaultPassword = 'sophia00'
   const seedUsers = [
     { name: '남이숙', email: 'namisuk@school.local', department: '행정실', position: '행정실장' },
     { name: '양혜련', email: 'yanghyerin@school.local', department: '기초과정', position: '기관장' },
     { name: '이수영', email: 'leesuyeong@school.local', department: '전형위원회', position: '기관장' },
-    { name: '유하정', email: 'yuhajeong@school.local', department: '본과정', position: '기관장' },
+    { name: '유화정', email: 'yuhajeong@school.local', department: '본과정', position: '기관장' },
     { name: '강대형', email: 'kangdaeyoung@school.local', department: '생활교육부', position: '기관장' },
     { name: '임은혁', email: 'imeunchul@school.local', department: '교무부', position: '기관장' },
     { name: '최지은', email: 'chojieun@school.local', department: '교육과정연구부', position: '기관장' },
     { name: '문숙영', email: 'moonsookyoung@school.local', department: '심화과정', position: '기관장' },
     { name: '고석수', email: 'goseoksu@school.local', department: '생활관', position: '기관장' },
+    { name: '이도서관', email: 'library@school.local', department: '도서관', position: '기관장' },
     { name: '박미숙', email: 'parkmisuk@school.local', department: '기초과정', position: '기안자' },
-    { name: '김정진', email: 'kimjeongjin@school.local', department: '본과정', position: '기안자' },
+    { name: '강정진', email: 'kimjeongjin@school.local', department: '본과정', position: '기안자' },
     { name: '박영주', email: 'parkyoungju@school.local', department: '심화과정', position: '기안자' },
     { name: '박숙희', email: 'parksukhee@school.local', department: '생활교육부', position: '기안자' },
     { name: '박상희', email: 'parksanghee@school.local', department: '교무부', position: '기안자' },
@@ -112,7 +215,33 @@ async function ensureSeedUsers() {
   ]
 
   for (const entry of seedUsers) {
-    const existing = db.prepare('SELECT * FROM users WHERE email = ? OR name = ? ORDER BY id LIMIT 1').get(entry.email, entry.name)
+    const matchingRows = db.prepare('SELECT * FROM users WHERE email = ? OR name = ? ORDER BY id').all(entry.email, entry.name)
+    const existing = matchingRows.find((row) => row.email === entry.email) ?? matchingRows[0] ?? null
+
+    if (entry.position === '기관장') {
+      const sameDepartmentHeads = db.prepare(`
+        SELECT id, email, name, active
+        FROM users
+        WHERE department = ? AND position = '기관장'
+        ORDER BY id
+      `).all(entry.department)
+
+      const keepId = existing?.id ?? sameDepartmentHeads.find((row) => row.email === entry.email || row.name === entry.name)?.id ?? sameDepartmentHeads[0]?.id ?? null
+
+      for (const row of sameDepartmentHeads) {
+        if (row.id !== keepId) {
+          db.prepare('UPDATE users SET active = 0 WHERE id = ?').run(row.id)
+        }
+      }
+    }
+
+    if (matchingRows.length > 1) {
+      const duplicateIds = matchingRows.filter((row) => row.id !== existing?.id).map((row) => row.id)
+      if (duplicateIds.length > 0) {
+        db.prepare(`DELETE FROM users WHERE id IN (${duplicateIds.map(() => '?').join(', ')})`).run(...duplicateIds)
+      }
+    }
+
     const passwordHash = await hashPassword(entry.position === '교장' ? 'gyver0979' : defaultPassword)
     const departmentValue = JSON.stringify([entry.department])
     const positionValue = JSON.stringify([entry.position])
@@ -170,6 +299,12 @@ const DEFAULT_BUDGET_CATALOG = {
     { 관: '학생복지비', 항: '생활관리비', 목: '생활관운영', 세목: '청소용품비', 내역: '생활관 청소 및 관리', 예산총액: 9000000, 예산잔액: 9000000, 집행률: 0 },
     { 관: '학생복지비', 항: '생활관리비', 목: '생활관운영', 세목: '안전관리비', 내역: '생활관 안전관리 소모품', 예산총액: 9000000, 예산잔액: 9000000, 집행률: 0 },
   ],
+  도서관: [
+    { 관: '교육활동비', 항: '도서관운영비', 목: '도서관운영', 세목: '도서구입비', 내역: '도서관 도서 및 정기간행물 구입', 예산총액: 2000000, 예산잔액: 2000000, 집행률: 0 },
+    { 관: '교육활동비', 항: '도서관운영비', 목: '도서관운영', 세목: '자료관리비', 내역: '도서관 자료 정리 및 관리비', 예산총액: 100000, 예산잔액: 100000, 집행률: 0 },
+    { 관: '교육활동비', 항: '도서관운영비', 목: '도서관운영', 세목: '정기구독비', 내역: '도서관 전자자료 및 정기구독료', 예산총액: 500000, 예산잔액: 500000, 집행률: 0 },
+    { 관: '교육활동비', 항: '도서관운영비', 목: '도서관운영', 세목: '시설유지비', 내역: '도서관 시설 유지 및 청소 관리', 예산총액: 800000, 예산잔액: 800000, 집행률: 0 },
+  ],
   전형위원회: [
     { 관: '교육행정비', 항: '전형운영비', 목: '전형운영', 세목: '전형자료비', 내역: '전형위원회 전형 자료 제작', 예산총액: 3000000, 예산잔액: 3000000, 집행률: 0 },
     { 관: '교육행정비', 항: '전형운영비', 목: '전형운영', 세목: '심사비', 내역: '전형위원회 심사운영비', 예산총액: 3000000, 예산잔액: 3000000, 집행률: 0 },
@@ -199,6 +334,8 @@ async function ensureBudgetCatalog() {
 }
 
 async function bootstrapDatabase() {
+  cleanDuplicateActiveRoleRows()
+  normalizeDuplicateDepartmentHeads()
   await purgeCorruptedUsers()
   await ensureStablePrincipal()
   await ensureSeedUsers()

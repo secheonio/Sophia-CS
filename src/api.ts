@@ -39,8 +39,15 @@ export const api = {
   me: () => call<{ user: User }>('GET', '/api/me'),
   login: (name: string, password: string) => call<{ user: User }>('POST', '/api/auth/login', { name, password }),
   logout: () => call<{ ok: true }>('POST', '/api/auth/logout'),
-  changePassword: (currentPassword: string, newPassword: string, contact?: { email?: string; phone?: string }) =>
-    call<{ user: User }>('POST', '/api/auth/change-password', { currentPassword, newPassword, ...(contact ?? {}) }),
+  changePassword: (currentPassword: string, newPassword: string, contact?: { email?: string; phone?: string }) => {
+    const payload: { currentPassword: string; newPassword: string; email?: string; phone?: string } = {
+      currentPassword,
+      newPassword,
+    }
+    if (contact?.email && contact.email.trim()) payload.email = contact.email.trim()
+    if (contact?.phone && contact.phone.trim()) payload.phone = contact.phone.trim()
+    return call<{ user: User }>('POST', '/api/auth/change-password', payload)
+  },
   meta: () => call<Meta>('GET', '/api/meta'),
   requests: () => call<{ requests: ExpenseRequest[] }>('GET', '/api/requests'),
   preview: (department?: string) => call<{ steps: ApprovalStep[] }>('GET', department ? `/api/approval-preview?department=${encodeURIComponent(department)}` : '/api/approval-preview'),
@@ -65,6 +72,8 @@ export const api = {
   }) => call<{ user: User }>('PATCH', `/api/users/${id}`, input),
   deleteUser: (id: number) => call<{ ok: true }>('DELETE', `/api/users/${id}`),
   resetPassword: (id: number) => call<{ temporaryPassword: string }>('POST', `/api/users/${id}/reset-password`),
+  saveBudgetMaster: (department: string, rows: unknown[]) =>
+    call<{ ok: true; department: string; rows: unknown[] }>('POST', `/api/budget-master/${encodeURIComponent(department)}`, { rows }),
   transferPrincipal: (input: { userId?: number; name?: string; email?: string; confirm: true }) =>
     call<{ user: User; temporaryPassword: string | null; transferredSteps: number }>('POST', '/api/principal/transfer', input),
 }

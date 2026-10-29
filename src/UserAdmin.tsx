@@ -1,20 +1,39 @@
-import { useCallback, useEffect, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { api, ApiError } from './api'
 import type { Meta, Position, User } from './types'
+import {
+  AFFILIATION_COLUMNS,
+  EMPTY_AFFILIATIONS,
+  buildDepartmentRoles,
+  derivePrimaryDepartment,
+  derivePrimaryPosition,
+  getSelectedDepartmentRoles,
+  getSelectedPositions,
+  sanitizeDepartmentRoles,
+  toInternalRole,
+  type AffiliationRole,
+} from './userRoleLogic'
 
-const AFFILIATION_COLUMNS = ['기초과정', '본과정', '심화과정', '교무부', '생활교육부', '교육과정연구부', '전형위원회', '생활관', '델포이', '행정실', '기타']
-const EMPTY_AFFILIATIONS = Object.fromEntries(AFFILIATION_COLUMNS.map((department) => [department, '없음'])) as Record<string, '없음' | '부서원' | '부장'>
+type TableColumnKey = 'name' | 'email' | 'phone' | 'department' | 'status' | 'action'
 
-function toAffiliationRole(department: string, user: User): '없음' | '부서원' | '부장' {
-  if (!user.departments.includes(department)) return '없음'
-  return user.positions.includes('기관장') ? '부장' : user.positions.includes('기안자') ? '부서원' : '없음'
+const DEFAULT_TABLE_COLUMN_WIDTHS: Record<TableColumnKey, number> = {
+  name: 52,
+  email: 180,
+  phone: 112,
+  department: 42,
+  status: 64,
+  action: 236,
+}
+const EXTRA_CONTENT_CHAR_COUNT = 5
+
+function measureTextWidth(text: string) {
+  const canvas = document.createElement('canvas')
+  const context = canvas.getContext('2d')
+  if (!context) return 0
+  context.font = '600 7.5px "DM Sans", "Noto Sans KR", "Malgun Gothic", sans-serif'
+  return Math.ceil(context.measureText(text).width)
 }
 
-function toInternalRole(value: '없음' | '부서원' | '부장'): Position | null {
-  if (value === '부장') return '기관장'
-  if (value === '부서원') return '기안자'
-  return null
-}
 
 type UserDraft = {
   email: string
@@ -23,6 +42,7 @@ type UserDraft = {
   position: Position
   departments: string[]
   positions: Position[]
+  departmentRoles: Record<string, AffiliationRole>
   active: boolean
 }
 
@@ -37,15 +57,18 @@ export function UserAdmin({ me, meta, onError }: { me: User; meta: Meta; onError
     phone: '',
     affiliations: { ...EMPTY_AFFILIATIONS },
   })
+  const [tableColumnWidths, setTableColumnWidths] = useState<Record<TableColumnKey, number>>(DEFAULT_TABLE_COLUMN_WIDTHS)
+  const tableRef = useRef<HTMLTableElement | null>(null)
 
   const updateQuickAddField = (field: 'name' | 'email' | 'phone', value: string) => {
+    const nextValue = field === 'phone' ? normalizePhoneInput(value) : value
     setQuickAdd((current) => ({
       ...current,
-      [field]: value,
+      [field]: nextValue,
     }))
   }
 
-  const updateQuickAddAffiliation = (department: string, value: '없음' | '부서원' | '부장') => {
+  const updateQuickAddAffiliation = (department: string, value: '없음' | '부장') => {
     setQuickAdd((current) => ({
       ...current,
       affiliations: {
@@ -55,8 +78,44 @@ export function UserAdmin({ me, meta, onError }: { me: User; meta: Meta; onError
       },
     }))
   }
+
+  const displayAffiliationRole = (value: AffiliationRole | undefined | null): '없음' | '부장' => {
+    if (value === '부장') return '부장'
+    return '없음'
+  }
   const [issued, setIssued] = useState<{ name: string; password: string } | null>(null)
+  const [saveNotice, setSaveNotice] = useState<string | null>(null)
   const [transfer, setTransfer] = useState<{ mode: 'existing' | 'new'; userId: string; name: string; email: string } | null>(null)
+
+  const normalizePhoneInput = (value: string) => value.replace(/\D/g, '').slice(0, 11)
+
+  function describeUserChanges(user: User, draft: UserDraft) {
+    const before = normalizeDraft(user)
+    const beforeLeadDepartments = AFFILIATION_COLUMNS.filter((department) => before.departmentRoles[department] === '부장')
+    const afterLeadDepartments = AFFILIATION_COLUMNS.filter((department) => draft.departmentRoles[department] === '부장')
+    const details: string[] = []
+
+    if (before.email !== draft.email) {
+      details.push(`이메일 ${before.email || '없음'} → ${draft.email || '없음'}`)
+    }
+    if (before.phone !== draft.phone) {
+      details.push(`전화번호 ${before.phone || '없음'} → ${draft.phone || '없음'}`)
+    }
+    if (before.position !== draft.position) {
+      details.push(`직위 ${before.position || '기안자'} → ${draft.position || '기안자'}`)
+    }
+    if (beforeLeadDepartments.join(',') !== afterLeadDepartments.join(',')) {
+      const beforeText = beforeLeadDepartments.length ? beforeLeadDepartments.join(', ') : '없음'
+      const afterText = afterLeadDepartments.length ? afterLeadDepartments.join(', ') : '없음'
+      details.push(`소속 ${beforeText} → ${afterText}`)
+    }
+
+    if (!details.length) {
+      return `${user.name}: 변경 없음`
+    }
+
+    return `${user.name}: ${details.join(' / ')}`
+  }
 
   async function transferPrincipal(event: FormEvent) {
     event.preventDefault()
@@ -78,15 +137,24 @@ export function UserAdmin({ me, meta, onError }: { me: User; meta: Meta; onError
     }
   }
 
-  const normalizeDraft = useCallback((user: User): UserDraft => ({
-    email: user.email ?? '',
-    phone: user.phone ?? '',
-    department: user.department,
-    position: user.position,
-    departments: user.departments.length ? user.departments : [user.department],
-    positions: user.positions.length ? user.positions : [user.position],
-    active: user.active,
-  }), [])
+  const normalizeDraft = useCallback((user: User): UserDraft => {
+    const departmentRoles = buildDepartmentRoles(user)
+    const selectedDepartments = getSelectedDepartmentRoles(departmentRoles)
+    const primaryDepartment = derivePrimaryDepartment(user.department, selectedDepartments, departmentRoles)
+    const primaryPosition = derivePrimaryPosition(primaryDepartment, departmentRoles, user.position)
+    const positions = getSelectedPositions(departmentRoles)
+
+    return {
+      email: user.email ?? '',
+      phone: user.phone ?? '',
+      department: primaryDepartment ?? user.department ?? '기타',
+      position: primaryPosition,
+      departments: selectedDepartments.length ? selectedDepartments : [user.department ?? '기타'],
+      positions: positions.length ? positions : [primaryPosition],
+      departmentRoles,
+      active: user.active,
+    }
+  }, [])
 
   const load = useCallback(async () => {
     try {
@@ -98,6 +166,34 @@ export function UserAdmin({ me, meta, onError }: { me: User; meta: Meta; onError
     }
   }, [normalizeDraft, onError])
 
+  useEffect(() => {
+    if (!tableRef.current) return
+
+    const nameValues = users.map((user) => user.name).concat(quickAdd.name || '이름')
+    const emailValues = users.map((user) => drafts[user.id]?.email ?? '').concat(quickAdd.email || '이메일')
+    const phoneValues = users.map((user) => drafts[user.id]?.phone ?? '').concat(quickAdd.phone || '01000000000')
+    const departmentValues = AFFILIATION_COLUMNS.flatMap((department: string) => (
+      users.map((user) => drafts[user.id]?.departmentRoles?.[department] ?? '없음')
+        .concat(quickAdd.affiliations[department] ?? '없음'))
+    )
+    const statusValues: string[] = [...users.map((user) => (user.active ? '사용 중' : '사용 중지')), '신규']
+    const actionValues = ['저장', '비번초기화', '사용중지', '재사용', '삭제', '추가']
+
+    const nextWidths: Record<TableColumnKey, number> = {
+      name: Math.max(DEFAULT_TABLE_COLUMN_WIDTHS.name, ...nameValues.map((value) => measureTextWidth(value) + 18)),
+      email: Math.max(
+        DEFAULT_TABLE_COLUMN_WIDTHS.email,
+        ...emailValues.map((value) => measureTextWidth(`${value || '이메일'}${'M'.repeat(EXTRA_CONTENT_CHAR_COUNT)}`) + 18),
+      ),
+      phone: Math.max(DEFAULT_TABLE_COLUMN_WIDTHS.phone, ...phoneValues.map((value) => measureTextWidth(value || '01000000000') + 18)),
+      department: Math.max(DEFAULT_TABLE_COLUMN_WIDTHS.department, ...departmentValues.map((value) => measureTextWidth(value) + 16)),
+      status: Math.max(DEFAULT_TABLE_COLUMN_WIDTHS.status, ...statusValues.map((value) => measureTextWidth(value) + 18)),
+      action: Math.max(DEFAULT_TABLE_COLUMN_WIDTHS.action, ...actionValues.map((value) => measureTextWidth(value) + 24)),
+    }
+
+    setTableColumnWidths(nextWidths)
+  }, [drafts, quickAdd, users])
+
   useEffect(() => { void load() }, [load])
 
   async function addQuickRow() {
@@ -108,19 +204,19 @@ export function UserAdmin({ me, meta, onError }: { me: User; meta: Meta; onError
     }
     const trimmedEmail = quickAdd.email.trim()
     const trimmedPhone = quickAdd.phone.trim()
-    if (trimmedEmail && !/^[^@\s]+@[^@\s]+$/.test(trimmedEmail)) {
-      onError('이메일 형식이 올바르지 않습니다. 예: anstnrdud@naver.com')
+    if (trimmedEmail && !trimmedEmail.includes('@')) {
+      onError('이메일은 @를 포함해야 합니다.')
       return
     }
-    if (trimmedPhone && !/^\d{3}-\d{4}-\d{4}$/.test(trimmedPhone)) {
-      onError('전화번호 형식이 올바르지 않습니다. 예: 010-1234-5678')
+    if (trimmedPhone && !/^\d{10,11}$/.test(trimmedPhone)) {
+      onError('전화번호 형식이 올바르지 않습니다. 예: 01012345678')
       return
     }
-    const selectedDepartments = AFFILIATION_COLUMNS.filter((department) => quickAdd.affiliations[department] !== '없음')
-    const selectedPositions = selectedDepartments.flatMap((department) => {
+    const selectedDepartments = AFFILIATION_COLUMNS.filter((department: string) => quickAdd.affiliations[department] !== '없음')
+    const selectedPositions = selectedDepartments.flatMap((department: string) => {
       const role = quickAdd.affiliations[department]
-      return role === '없음' ? [] : [toInternalRole(role)]
-    }).filter((position): position is Position => position !== null)
+      return role === '없음' ? [] : [toInternalRole(role, department)]
+    }).filter((position: Position | null): position is Position => position !== null)
     const primaryDepartment: string = selectedDepartments[0] ?? defaultDepartments[0] ?? '기타'
     const primaryPosition: Position = selectedPositions[0] ?? '기안자'
     try {
@@ -155,67 +251,82 @@ export function UserAdmin({ me, meta, onError }: { me: User; meta: Meta; onError
     await load()
   }
 
-  async function saveUser(user: User) {
-    const draft = drafts[user.id]
-    if (!draft) return
+  async function saveAllUsers() {
+    const dirtyUsers = users.filter((user) => {
+      const draft = drafts[user.id] ?? normalizeDraft(user)
+      return JSON.stringify(draft) !== JSON.stringify(normalizeDraft(user))
+    })
 
-    const nextEmail = draft.email.trim()
-    const nextPhone = draft.phone.trim()
-    if (nextEmail && !/^[^@\s]+@[^@\s]+$/.test(nextEmail)) {
-      onError('이메일 형식이 올바르지 않습니다. 예: anstnrdud@naver.com')
-      return
-    }
-    if (nextPhone && !/^\d{3}-\d{4}-\d{4}$/.test(nextPhone)) {
-      onError('전화번호 형식이 올바르지 않습니다. 예: 010-1234-5678')
-      return
-    }
+    if (!dirtyUsers.length) return
 
     try {
-      await api.updateUser(user.id, {
-        email: nextEmail,
-        phone: nextPhone,
-        department: draft.department,
-        position: draft.position,
-        departments: draft.departments,
-        positions: draft.positions,
-        active: draft.active,
-      })
+      for (const user of dirtyUsers) {
+        const draft = drafts[user.id] ?? normalizeDraft(user)
+        const nextEmail = draft.email.trim()
+        const nextPhone = draft.phone.trim()
+
+        if (nextEmail && !nextEmail.includes('@')) {
+          throw new Error(`${user.name}의 이메일은 @를 포함해야 합니다.`)
+        }
+        if (nextPhone && !/^\d{10,11}$/.test(nextPhone)) {
+          throw new Error(`${user.name}의 전화번호가 올바르지 않습니다.`)
+        }
+
+        await api.updateUser(user.id, {
+          email: nextEmail,
+          phone: nextPhone,
+          department: draft.department,
+          position: draft.position,
+          departments: draft.departments,
+          positions: draft.positions,
+          active: draft.active,
+        })
+      }
+
       await load()
+      const savedSummaries = dirtyUsers.map((user) => {
+        const draft = drafts[user.id] ?? normalizeDraft(user)
+        return describeUserChanges(user, draft)
+      })
+      setSaveNotice(`${dirtyUsers.length}명의 변경 사항이 저장되었습니다. ${savedSummaries.join(' / ')}`)
     } catch (caught) {
-      onError(caught instanceof ApiError ? caught.message : '변경 내용을 저장하지 못했습니다.')
+      onError(caught instanceof Error ? caught.message : '변경 내용을 저장하지 못했습니다.')
     }
   }
 
   function updateContact(user: User, field: 'email' | 'phone', value: string) {
     const draft = drafts[user.id] ?? normalizeDraft(user)
+    const nextValue = field === 'phone' ? normalizePhoneInput(value) : value
     setDrafts((current) => ({
       ...current,
       [user.id]: {
         ...draft,
-        [field]: value,
+        [field]: nextValue,
       },
     }))
   }
 
-  function updateAffiliationRole(user: User, department: string, nextValue: '없음' | '부서원' | '부장') {
+  function updateAffiliationRole(user: User, department: string, nextValue: AffiliationRole) {
     const draft = drafts[user.id] ?? normalizeDraft(user)
-    const nextDepartments = nextValue === '없음'
-      ? draft.departments.filter((item) => item !== department)
-      : Array.from(new Set([...draft.departments.filter((item) => item !== department), department]))
-    const internalRole = toInternalRole(nextValue)
-    const nextPositions = internalRole
-      ? Array.from(new Set([...draft.positions.filter((position) => position !== '기안자' && position !== '기관장'), internalRole]))
-      : draft.positions.filter((position) => position !== '기안자' && position !== '기관장')
-    const nextPrimaryDepartment = nextDepartments[0] ?? draft.department
-    const nextPrimaryPosition = nextPositions[0] ?? draft.position
+    const nextRoles = sanitizeDepartmentRoles(
+      { ...draft.departmentRoles, [department]: nextValue },
+      department,
+    )
+
+    const nextDepartments = getSelectedDepartmentRoles(nextRoles)
+    const nextPrimaryDepartment = derivePrimaryDepartment(draft.department, nextDepartments, nextRoles, department)
+    const nextPrimaryPosition = derivePrimaryPosition(nextPrimaryDepartment, nextRoles, draft.position)
+    const nextPositions = getSelectedPositions(nextRoles)
+
     setDrafts((current) => ({
       ...current,
       [user.id]: {
         ...draft,
-        department: nextPrimaryDepartment,
-        departments: nextDepartments.length ? nextDepartments : [draft.department],
+        department: nextPrimaryDepartment ?? draft.department ?? '기타',
+        departments: nextDepartments.length ? nextDepartments : [nextPrimaryDepartment ?? draft.department ?? '기타'],
         position: nextPrimaryPosition,
-        positions: nextPositions.length ? nextPositions : [draft.position],
+        positions: nextPositions.length ? nextPositions : [nextPrimaryPosition],
+        departmentRoles: nextRoles,
       },
     }))
   }
@@ -258,6 +369,14 @@ export function UserAdmin({ me, meta, onError }: { me: User; meta: Meta; onError
         </div>
       )}
 
+      {saveNotice && (
+        <div className="temp-password" role="status">
+          <strong>저장 결과</strong>
+          <span>{saveNotice}</span>
+          <button type="button" className="cancel-button" onClick={() => setSaveNotice(null)}>닫기</button>
+        </div>
+      )}
+
       <section className="requests-panel">
         <div className="panel-heading"><div><h2>교장 교체</h2><p>교장이 바뀔 때 관리자 권한과 결재권을 새 교장에게 넘깁니다. 진행 중인 교장 결재도 함께 넘어가고, 새 교장은 과거 품의도 모두 볼 수 있습니다.</p></div>
           {!transfer && <button type="button" className="cancel-button" onClick={() => setTransfer({ mode: 'new', userId: '', name: '', email: '' })}>교장 교체 시작</button>}
@@ -292,66 +411,73 @@ export function UserAdmin({ me, meta, onError }: { me: User; meta: Meta; onError
       </section>
 
       <section className="requests-panel">
-        <div className="panel-heading"><div><h2>사용자 목록</h2><p>총 {users.length}명</p></div></div>
+        <div className="panel-heading">
+          <div><h2>사용자 목록({users.length}명)</h2></div>
+          <button type="button" className="primary-button" onClick={() => void saveAllUsers()}>저장하기</button>
+        </div>
         <div className="table-wrap">
-          <table className="user-matrix-table">
+          <table ref={tableRef} className="user-matrix-table">
             <thead>
               <tr>
-                <th>이름</th>
-                <th>이메일</th>
-                <th>전화번호</th>
-                {AFFILIATION_COLUMNS.map((department) => <th key={department}>{department}</th>)}
-                <th>상태</th>
-                <th /></tr>
+                <th style={{ width: tableColumnWidths.name }}>이름</th>
+                <th style={{ width: tableColumnWidths.email }}>이메일</th>
+                <th style={{ width: tableColumnWidths.phone }}>전화번호</th>
+                {AFFILIATION_COLUMNS.map((department: string) => <th key={department} style={{ width: tableColumnWidths.department }}>{department}</th>)}
+                <th style={{ width: tableColumnWidths.status }}>상태</th>
+                <th style={{ width: tableColumnWidths.action }} /></tr>
             </thead>
             <tbody>
               {users.map((user) => {
                 const draft = drafts[user.id] ?? normalizeDraft(user)
-                const currentUser = { ...user, ...draft, departments: draft.departments, positions: draft.positions }
                 const isMe = user.id === me.id
-                const isDirty = JSON.stringify(draft) !== JSON.stringify(normalizeDraft(user))
                 return (
                   <tr key={user.id} className={user.active ? '' : 'row-inactive'}>
-                    <td>{user.name}</td>
-                    <td><input type="text" inputMode="email" pattern="^[^@\\s]+@[^@\\s]+$" title="anstnrdud@naver.com" value={draft.email} onChange={(e) => updateContact(user, 'email', e.currentTarget.value)} /></td>
-                    <td><input type="tel" pattern="^\\d{3}-\\d{4}-\\d{4}$" title="010-1234-5678" value={draft.phone} onChange={(e) => updateContact(user, 'phone', e.currentTarget.value)} /></td>
-                    {AFFILIATION_COLUMNS.map((department) => (
-                      <td key={`${user.id}-${department}`}>
-                        <select aria-label={`${user.name} ${department} 소속`} value={toAffiliationRole(department, currentUser)} disabled={isMe} onChange={(e) => {
-                          const nextValue = e.currentTarget.value as '없음' | '부서원' | '부장'
-                          updateAffiliationRole(user, department, nextValue)
-                        }}>
-                          <option value="없음">없음</option>
-                          <option value="부서원">부서원</option>
-                          <option value="부장">부장</option>
-                        </select>
-                      </td>
-                    ))}
-                    <td>{user.active ? '사용 중' : '사용 중지'}</td>
-                    <td className="user-actions">
-                      <button type="button" className="primary-button" disabled={!isDirty} onClick={() => void saveUser(user)}>저장</button>
-                      <button type="button" className="cancel-button" onClick={() => void reset(user)}>비밀번호 초기화</button>
-                      {!isMe && <button type="button" className="cancel-button" onClick={() => void update(user, { active: !user.active })}>{user.active ? '사용 중지' : '다시 사용'}</button>}
+                    <td style={{ width: tableColumnWidths.name }}>{user.name}</td>
+                    <td style={{ width: tableColumnWidths.email }}><input type="text" inputMode="email" pattern="^[^@\\s]+@[^@\\s]+$" title="anstnrdud@naver.com" value={draft.email} onChange={(e) => updateContact(user, 'email', e.currentTarget.value)} /></td>
+                    <td style={{ width: tableColumnWidths.phone }}><input type="tel" inputMode="numeric" pattern="^\\d{10,11}$" title="01012345678" value={draft.phone} onChange={(e) => updateContact(user, 'phone', e.currentTarget.value)} /></td>
+                    {AFFILIATION_COLUMNS.map((department: string) => {
+                      const isHeadDepartment = draft.departmentRoles[department] === '부장'
+                      return (
+                        <td key={`${user.id}-${department}`} style={{ width: tableColumnWidths.department }} className={isHeadDepartment ? 'role-cell role-cell-head' : 'role-cell'}>
+                          <select
+                            aria-label={`${user.name} ${department} 소속`}
+                            className={isHeadDepartment ? 'role-select role-select-head' : 'role-select role-select-none'}
+                            value={displayAffiliationRole(draft.departmentRoles[department])}
+                            disabled={isMe}
+                            onChange={(e) => {
+                              const nextValue = e.currentTarget.value as '없음' | '부장'
+                              updateAffiliationRole(user, department, nextValue)
+                            }}
+                          >
+                            <option value="없음">없음</option>
+                            <option value="부장">부장</option>
+                          </select>
+                        </td>
+                      )
+                    })}
+                    <td style={{ width: tableColumnWidths.status }}>{user.active ? '사용 중' : '사용 중지'}</td>
+                    <td className="user-actions" style={{ width: tableColumnWidths.action, minWidth: tableColumnWidths.action }}>
+                      <button type="button" className="cancel-button" onClick={() => void reset(user)}>비번초기화</button>
+                      {!isMe && <button type="button" className="cancel-button" onClick={() => void update(user, { active: !user.active })}>{user.active ? '사용중지' : '재사용'}</button>}
                       {!isMe && <button type="button" className="reject-confirm" onClick={() => void removeUser(user)}>삭제</button>}
                     </td>
                   </tr>
                 )
               })}
               <tr className="new-user-row">
-                <td><input value={quickAdd.name} onChange={(e) => updateQuickAddField('name', e.target.value)} placeholder="이름" /></td>
-                <td><input type="text" inputMode="email" pattern="^[^@\\s]+@[^@\\s]+$" title="anstnrdud@naver.com" value={quickAdd.email} onChange={(e) => updateQuickAddField('email', e.target.value)} placeholder="이메일 (선택)" /></td>
-                <td><input type="tel" pattern="^\\d{3}-\\d{4}-\\d{4}$" title="010-1234-5678" value={quickAdd.phone} onChange={(e) => updateQuickAddField('phone', e.target.value)} placeholder="전화번호 (선택)" /></td>
-                {AFFILIATION_COLUMNS.map((department) => (
-                  <td key={`quick-${department}`}>
-                    <select value={quickAdd.affiliations[department] ?? '없음'} onChange={(e) => updateQuickAddAffiliation(department, e.target.value as '없음' | '부서원' | '부장')}>
+                <td style={{ width: tableColumnWidths.name }}><input value={quickAdd.name} onChange={(e) => updateQuickAddField('name', e.target.value)} placeholder="이름" /></td>
+                <td style={{ width: tableColumnWidths.email }}><input type="text" inputMode="email" pattern="^[^@\\s]+@[^@\\s]+$" title="anstnrdud@naver.com" value={quickAdd.email} onChange={(e) => updateQuickAddField('email', e.target.value)} placeholder="이메일 (선택)" /></td>
+                <td style={{ width: tableColumnWidths.phone }}><input type="tel" inputMode="numeric" pattern="^\\d{10,11}$" title="01012345678" value={quickAdd.phone} onChange={(e) => updateQuickAddField('phone', normalizePhoneInput(e.target.value))} placeholder="전화번호 (선택)" /></td>
+                {AFFILIATION_COLUMNS.map((department: string) => (
+                  <td key={`quick-${department}`} style={{ width: tableColumnWidths.department }}>
+                    <select value={quickAdd.affiliations[department] ?? '없음'} onChange={(e) => updateQuickAddAffiliation(department, e.target.value as '없음' | '부장')}>
                       <option value="없음">없음</option>
-                      <option value="부서원">부서원</option>
                       <option value="부장">부장</option>
                     </select>
                   </td>
                 ))}
-                <td>신규</td>
-                <td className="user-actions">
+                <td style={{ width: tableColumnWidths.status }}>신규</td>
+                <td className="user-actions" style={{ width: tableColumnWidths.action, minWidth: tableColumnWidths.action }}>
                   <button type="button" className="primary-button" onClick={() => void addQuickRow()}>추가</button>
                 </td>
               </tr>

@@ -51,6 +51,324 @@ function toId(value) {
   return id
 }
 
+function asNumber(value, fallback = 0) {
+  const parsed = Number(value ?? fallback)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
+function calculateExecutionRate(total, remaining) {
+  const totalAmount = Math.max(0, asNumber(total, 0))
+  const remainingAmount = Math.max(0, asNumber(remaining, 0))
+  if (totalAmount === 0) return 0
+  return Number((((totalAmount - remainingAmount) / totalAmount) * 100).toFixed(2))
+}
+
+function normalizeBudgetRow(row) {
+  const total = Math.max(0, asNumber(row?.예산총액, 0))
+  const remaining = Math.min(Math.max(0, asNumber(row?.예산잔액, 0)), total)
+  return {
+    관: String(row?.관 ?? '').trim(),
+    항: String(row?.항 ?? '').trim(),
+    목: String(row?.목 ?? '').trim(),
+    세목: String(row?.세목 ?? '').trim(),
+    내역: String(row?.내역 ?? '').trim(),
+    예산총액: total,
+    예산잔액: remaining,
+    집행률: calculateExecutionRate(total, remaining),
+  }
+}
+
+function parseBudgetRows(value) {
+  if (!value) return []
+  try {
+    const parsed = Array.isArray(value) ? value : JSON.parse(value)
+    return Array.isArray(parsed) ? parsed.map(normalizeBudgetRow) : []
+  } catch {
+    return []
+  }
+}
+
+function readDepartmentBudgetRows(dbRef, department) {
+  const row = dbRef.prepare('SELECT rows_json FROM budget_master WHERE department = ?').get(department)
+  const parsed = parseBudgetRows(row?.rows_json)
+  if (parsed.length > 0) return parsed
+  const persisted = dbRef.prepare(
+    'SELECT gwan, hang, mok, semok, nae, total_amount, remaining_amount, execution_rate FROM budget_rows WHERE department = ? ORDER BY id',
+  ).all(department)
+  return persisted.map((item) => ({
+    관: item.gwan,
+    항: item.hang,
+    목: item.mok,
+    세목: item.semok,
+    내역: item.nae,
+    예산총액: asNumber(item.total_amount, 0),
+    예산잔액: asNumber(item.remaining_amount, 0),
+    집행률: asNumber(item.execution_rate, 0),
+  }))
+}
+
+function saveDepartmentBudgetRows(dbRef, department, rows) {
+  const normalized = (Array.isArray(rows) ? rows : []).map(normalizeBudgetRow)
+  dbRef.prepare('INSERT INTO budget_master (department, rows_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(department) DO UPDATE SET rows_json = excluded.rows_json, updated_at = excluded.updated_at')
+    .run(department, JSON.stringify(normalized), today())
+
+  dbRef.prepare('DELETE FROM budget_rows WHERE department = ?').run(department)
+  const insert = dbRef.prepare(
+    `INSERT INTO budget_rows (department, gwan, hang, mok, semok, nae, total_amount, remaining_amount, execution_rate, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+  for (const row of normalized) {
+    insert.run(
+      department,
+      row.관,
+      row.항,
+      row.목,
+      row.세목,
+      row.내역,
+      row.예산총액,
+      row.예산잔액,
+      row.집행률,
+      today(),
+    )
+  }
+  return normalized
+}
+
+function getDepartmentBudgetAllocation(dbRef, requestId) {
+  const allocation = dbRef.prepare('SELECT * FROM request_budget_allocations WHERE request_id = ?').get(requestId)
+  if (!allocation) return null
+  const budgetRow = dbRef.prepare('SELECT * FROM budget_rows WHERE id = ?').get(allocation.budget_row_id)
+  if (!budgetRow) return null
+  return {
+    allocation,
+    budgetRow,
+    department: budgetRow.department,
+    fields: {
+      관: budgetRow.gwan,
+      항: budgetRow.hang,
+      목: budgetRow.mok,
+      세목: budgetRow.semok,
+      내역: budgetRow.nae,
+    },
+  }
+}
+
+function updateBudgetAllocationStatus(dbRef, requestId, status, approvedAmount = 0) {
+  dbRef.prepare(
+    'UPDATE request_budget_allocations SET approved_amount = ?, status = ?, allocated_at = ? WHERE request_id = ?',
+  ).run(approvedAmount, status, new Date().toISOString(), requestId)
+}
+
+function matchBudgetRow(a, b) {
+  if (!a || !b) return false
+  return ['관', '항', '목', '세목', '내역'].every((field) => String(a[field] ?? '').trim() === String(b[field] ?? '').trim())
+}
+
+function normalizePaymentRowAttachments(value) {
+  if (!Array.isArray(value)) return []
+  return value
+    .filter((item) => item && typeof item === 'object')
+    .map((item) => ({
+      id: Number(item.id) || undefined,
+      name: String(item.name ?? '').trim() || '영수증',
+      size: Number(item.size) || 0,
+      mime: String(item.mime ?? 'image/png'),
+      dataUrl: typeof item.dataUrl === 'string' ? item.dataUrl : undefined,
+    }))
+}
+
+function normalizePaymentRows(rows) {
+  if (!Array.isArray(rows)) return []
+  const cleaned = []
+  rows.forEach((row, index) => {
+    const summary = String(row?.summary ?? '').trim()
+    const date = String(row?.date ?? '').trim()
+    const payer = String(row?.payer ?? '').trim()
+    const method = String(row?.method ?? '').trim()
+    const rawAmount = String(row?.amount ?? '').trim()
+    const attachments = normalizePaymentRowAttachments(row?.attachments)
+    const hasAnyContent = summary || date || rawAmount || payer || method || attachments.length > 0
+    if (!hasAnyContent) return
+    const numericAmount = Number(rawAmount.replace(/[^0-9-]/g, ''))
+    if (!Number.isFinite(numericAmount) || numericAmount < 0) {
+      throw new HttpError(400, `${index + 1}번째 지급 내역의 금액을 확인해 주세요.`)
+    }
+    if (!summary) throw new HttpError(400, `${index + 1}번째 지급 내역의 적요를 입력해 주세요.`)
+    if (!payer) throw new HttpError(400, `${index + 1}번째 지급 내역의 성명(상호)를 입력해 주세요.`)
+    if (!method) throw new HttpError(400, `${index + 1}번째 지급 내역의 지급방법을 입력해 주세요.`)
+    cleaned.push({
+      seq: cleaned.length + 1,
+      summary,
+      date: date || today(),
+      amount: Math.round(numericAmount),
+      payer,
+      method,
+      attachments,
+    })
+  })
+  return cleaned
+}
+
+function readPaymentRows(dbRef, requestId) {
+  const rows = dbRef.prepare(
+    `SELECT pr.id AS row_id, pr.seq, pr.summary, pr.date_text, pr.amount, pr.payer, pr.method,
+            a.id AS attachment_id, a.name AS attachment_name, a.size_bytes, a.mime
+     FROM request_payment_rows pr
+     LEFT JOIN attachments a ON a.payment_row_id = pr.id
+     WHERE pr.request_id = ?
+     ORDER BY pr.seq, a.id`,
+  ).all(requestId)
+
+  const map = new Map()
+  for (const row of rows) {
+    let entry = map.get(row.row_id)
+    if (!entry) {
+      entry = {
+        id: row.row_id,
+        seq: row.seq,
+        summary: row.summary,
+        date: row.date_text,
+        amount: Number(row.amount || 0),
+        payer: row.payer,
+        method: row.method,
+        attachments: [],
+      }
+      map.set(row.row_id, entry)
+    }
+    if (row.attachment_id) {
+      entry.attachments.push({
+        id: row.attachment_id,
+        name: row.attachment_name,
+        size: Number(row.size_bytes || 0),
+        mime: row.mime || 'image/png',
+      })
+    }
+  }
+  return [...map.values()]
+}
+
+function savePaymentRows(dbRef, requestId, rows) {
+  const preserved = new Map()
+  dbRef.prepare('SELECT id, name, mime, size_bytes, data FROM attachments WHERE request_id = ? AND payment_row_id IS NOT NULL ORDER BY id')
+    .all(requestId)
+    .forEach((item) => {
+      preserved.set(Number(item.id), {
+        name: item.name,
+        mime: item.mime,
+        size: Number(item.size_bytes || 0),
+        data: Buffer.from(item.data),
+      })
+    })
+
+  dbRef.prepare('DELETE FROM request_payment_rows WHERE request_id = ?').run(requestId)
+  if (!Array.isArray(rows) || rows.length === 0) return
+  const insert = dbRef.prepare(
+    'INSERT INTO request_payment_rows (request_id, seq, summary, date_text, amount, payer, method) VALUES (?, ?, ?, ?, ?, ?, ?)',
+  )
+  const insertAttachment = dbRef.prepare(
+    'INSERT INTO attachments (request_id, payment_row_id, name, mime, size_bytes, data) VALUES (?, ?, ?, ?, ?, ?)',
+  )
+  rows.forEach((row) => {
+    const saved = insert.run(requestId, row.seq, row.summary, row.date, row.amount, row.payer, row.method)
+    const paymentRowId = Number(saved.lastInsertRowid)
+    const attachments = Array.isArray(row.attachments) ? row.attachments : []
+    for (const attachment of attachments) {
+      const attachmentId = attachment && attachment.id !== undefined ? Number(attachment.id) : null
+      const preservedAttachment = attachmentId !== null ? preserved.get(attachmentId) : undefined
+      const decoded = typeof attachment?.dataUrl === 'string'
+        ? decodeImage({ name: attachment.name || '영수증', dataUrl: attachment.dataUrl })
+        : preservedAttachment
+          ? {
+              name: String(attachment?.name || preservedAttachment.name || '영수증').trim() || '영수증',
+              mime: preservedAttachment.mime || 'image/png',
+              data: Buffer.from(preservedAttachment.data),
+            }
+          : null
+      if (!decoded) continue
+      insertAttachment.run(
+        requestId,
+        paymentRowId,
+        String(attachment?.name || decoded.name || '영수증').trim() || '영수증',
+        decoded.mime || attachment?.mime || 'image/png',
+        Number(attachment?.size || decoded.data.length || 0),
+        decoded.data,
+      )
+    }
+  })
+}
+
+function getBudgetSelectionForDepartment(dbRef, department, budgetFields) {
+  const rows = readDepartmentBudgetRows(dbRef, department)
+  if (!budgetFields || typeof budgetFields !== 'object') return null
+  const target = {
+    관: String(budgetFields.관 ?? '').trim(),
+    항: String(budgetFields.항 ?? '').trim(),
+    목: String(budgetFields.목 ?? '').trim(),
+    세목: String(budgetFields.세목 ?? '').trim(),
+    내역: String(budgetFields.내역 ?? '').trim(),
+  }
+  if (!target.관 && !target.항 && !target.목 && !target.세목 && !target.내역) return null
+  return rows.find((row) => matchBudgetRow(row, target)) ?? null
+}
+
+function reserveBudgetForRequest(dbRef, requestId, department, budgetFields, amount) {
+  if (!budgetFields || typeof budgetFields !== 'object' || Object.values(budgetFields).every((value) => String(value ?? '').trim() === '')) {
+    return null
+  }
+  const match = getBudgetSelectionForDepartment(dbRef, department, budgetFields)
+  if (!match) {
+    throw new HttpError(400, '예산 항목을 선택해 주세요.')
+  }
+  const remaining = Math.max(0, asNumber(match.예산잔액, 0))
+  if (amount > remaining) {
+    throw new HttpError(400, `선택한 예산 항목의 잔액이 부족합니다. 남은 예산 ${remaining.toLocaleString('ko-KR')}원 이하로 입력해 주세요.`)
+  }
+
+  const rows = readDepartmentBudgetRows(dbRef, department).map((row) => {
+    if (!matchBudgetRow(row, budgetFields)) return row
+    const nextRemaining = Math.max(0, asNumber(row.예산잔액, 0) - amount)
+    return { ...row, 예산잔액: nextRemaining, 집행률: calculateExecutionRate(row.예산총액, nextRemaining) }
+  })
+  saveDepartmentBudgetRows(dbRef, department, rows)
+
+  const budgetRow = dbRef.prepare(
+    'SELECT id FROM budget_rows WHERE department = ? AND gwan = ? AND hang = ? AND mok = ? AND semok = ? AND nae = ?',
+  ).get(department, match.관, match.항, match.목, match.세목, match.내역)
+  const existing = dbRef.prepare('SELECT * FROM request_budget_allocations WHERE request_id = ?').get(requestId)
+  if (existing) {
+    dbRef.prepare(
+      `UPDATE request_budget_allocations SET budget_row_id = ?, requested_amount = ?, approved_amount = ?, status = 'pending', allocated_at = ?
+       WHERE request_id = ?`,
+    ).run(budgetRow?.id ?? 0, amount, 0, new Date().toISOString(), requestId)
+  } else if (budgetRow) {
+    dbRef.prepare(
+      `INSERT INTO request_budget_allocations (request_id, budget_row_id, requested_amount, approved_amount, allocated_at, status)
+       VALUES (?, ?, ?, 0, ?, 'pending')`,
+    ).run(requestId, budgetRow.id, amount, new Date().toISOString())
+  }
+  return match
+}
+
+function restoreBudgetForRequest(dbRef, requestId, department, budgetFields, amount) {
+  const allocation = getDepartmentBudgetAllocation(dbRef, requestId)
+  const resolvedFields = budgetFields || allocation?.fields || null
+  const resolvedDepartment = department || allocation?.department || null
+  if (!resolvedDepartment || !resolvedFields) return null
+
+  const match = getBudgetSelectionForDepartment(dbRef, resolvedDepartment, resolvedFields)
+  if (!match) return null
+
+  const rows = readDepartmentBudgetRows(dbRef, resolvedDepartment).map((row) => {
+    if (!matchBudgetRow(row, resolvedFields)) return row
+    const nextRemaining = Math.max(0, asNumber(row.예산잔액, 0) + amount)
+    const safeTotal = asNumber(row.예산총액, 0)
+    return { ...row, 예산잔액: Math.min(nextRemaining, safeTotal), 집행률: calculateExecutionRate(safeTotal, Math.min(nextRemaining, safeTotal)) }
+  })
+  saveDepartmentBudgetRows(dbRef, resolvedDepartment, rows)
+  updateBudgetAllocationStatus(dbRef, requestId, 'restored', 0)
+  return match
+}
+
 export function createApp(db, { secureCookie = false, trustProxy = false, staticDir } = {}) {
   const app = express()
   app.disable('x-powered-by')
@@ -177,22 +495,36 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
       if (nextPassword === currentPassword) throw new HttpError(400, '새 비밀번호는 현재 비밀번호와 달라야 합니다.')
     }
 
-    const emailValue = typeof body.email === 'string' ? body.email.trim() : (req.user.email ?? '')
-    const phoneValue = typeof body.phone === 'string' ? body.phone.trim() : (req.user.phone ?? '')
-    const requireContact = body.email !== undefined || body.phone !== undefined
-    if (requireContact) {
-      if (!emailValue) throw new HttpError(400, '이메일을 입력해 주세요.')
-      if (!phoneValue) throw new HttpError(400, '전화번호를 입력해 주세요.')
-      const normalizedEmail = validateEmail(emailValue)
-      const normalizedPhone = validatePhone(phoneValue)
-      const existing = q('SELECT id FROM users WHERE email = ? AND id != ?').get(normalizedEmail, req.user.id)
-      if (existing) throw new HttpError(409, '이미 등록된 이메일입니다.')
-      q('UPDATE users SET email = ?, phone = ? WHERE id = ?').run(normalizedEmail, normalizedPhone, req.user.id)
+    const hasEmailInput = Object.prototype.hasOwnProperty.call(body, 'email')
+    const hasPhoneInput = Object.prototype.hasOwnProperty.call(body, 'phone')
+    const emailValue = typeof body.email === 'string' ? body.email.trim() : (hasEmailInput ? '' : (req.user.email ?? ''))
+    const phoneValue = typeof body.phone === 'string' ? body.phone.trim() : (hasPhoneInput ? '' : (req.user.phone ?? ''))
+    const shouldUpdateEmail = hasEmailInput && emailValue !== ''
+    const shouldUpdatePhone = hasPhoneInput && phoneValue !== ''
+    if (hasEmailInput || hasPhoneInput) {
+      if (shouldUpdateEmail && !emailValue.includes('@')) {
+        throw new HttpError(400, '이메일은 @를 포함해야 합니다.')
+      }
+      if (shouldUpdatePhone && !/^\d{10,11}$/.test(phoneValue)) {
+        throw new HttpError(400, '전화번호 형식이 올바르지 않습니다. (예: 01012345678)')
+      }
+      if (shouldUpdateEmail) {
+        const normalizedEmail = validateEmail(emailValue)
+        const existing = q('SELECT id FROM users WHERE email = ? AND id != ?').get(normalizedEmail, req.user.id)
+        if (existing) throw new HttpError(409, '이미 등록된 이메일입니다.')
+        q('UPDATE users SET email = ? WHERE id = ?').run(normalizedEmail, req.user.id)
+      }
+      if (shouldUpdatePhone) {
+        const normalizedPhone = validatePhone(phoneValue)
+        q('UPDATE users SET phone = ? WHERE id = ?').run(normalizedPhone, req.user.id)
+      }
     }
 
     if (wantsPasswordChange) {
       const hash = await hashPassword(nextPassword)
       q('UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?').run(hash, req.user.id)
+    } else if (req.user.must_change_password) {
+      throw new HttpError(400, '새 비밀번호를 입력해 주세요.')
     }
 
     q('DELETE FROM sessions WHERE user_id = ?').run(req.user.id)
@@ -202,7 +534,7 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
   })
 
   app.get('/api/meta', ...ready, (_req, res) => {
-    const budgetDepartments = ['기초과정', '본과정', '심화과정', '교무부', '교육과정연구부', '생활교육부', '전형위원회', '델포이', '생활관', '행정실']
+    const budgetDepartments = ['기초과정', '본과정', '심화과정', '교무부', '교육과정연구부', '생활교육부', '전형위원회', '델포이', '생활관', '도서관', '행정실']
     const budgetCatalog = {}
     for (const department of budgetDepartments) {
       const row = q('SELECT rows_json FROM budget_master WHERE department = ?').get(department)
@@ -218,6 +550,25 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
       budgetDepartments,
       budgetCatalog,
     })
+  })
+
+  app.post('/api/budget-master/:department', ...ready, requireAdmin, smallJson, (req, res) => {
+    const department = String(req.params.department ?? '').trim()
+    if (!department) throw new HttpError(400, '상신 단위를 선택해 주세요.')
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : []
+    const normalized = rows.map((row) => ({
+      관: String(row?.관 ?? '').trim(),
+      항: String(row?.항 ?? '').trim(),
+      목: String(row?.목 ?? '').trim(),
+      세목: String(row?.세목 ?? '').trim(),
+      내역: String(row?.내역 ?? '').trim(),
+      예산총액: Number(row?.예산총액 ?? 0),
+      예산잔액: Number(row?.예산잔액 ?? 0),
+      집행률: Number(row?.집행률 ?? 0),
+    }))
+    q('INSERT INTO budget_master (department, rows_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(department) DO UPDATE SET rows_json = excluded.rows_json, updated_at = excluded.updated_at')
+      .run(department, JSON.stringify(normalized), today())
+    res.json({ ok: true, department, rows: normalized })
   })
 
   // ---- 사용자 관리 (교장) ----
@@ -249,8 +600,8 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
     const positions = Array.isArray(body.positions) ? body.positions : [body.position ?? '기안자']
     if (!departments.length) throw new HttpError(400, '소속을 1개 이상 선택해 주세요.')
     if (!positions.length) throw new HttpError(400, '직책을 1개 이상 선택해 주세요.')
-    const primaryDepartment = departments[0]
-    const primaryPosition = positions[0]
+    const primaryDepartment = departments[0] ?? '기타'
+    const primaryPosition = positions[0] ?? '기안자'
     validateRole(primaryDepartment, primaryPosition)
     const temporaryPassword = generateTemporaryPassword()
     const hash = await hashPassword(temporaryPassword)
@@ -270,20 +621,31 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
     const target = q('SELECT * FROM users WHERE id = ?').get(toId(req.params.id))
     if (!target) throw new HttpError(404, '사용자를 찾을 수 없습니다.')
     const body = req.body ?? {}
-    const parsedDepartments = Array.isArray(body.departments) ? body.departments : (body.department ? [body.department] : parseList(target.departments))
-    const parsedPositions = Array.isArray(body.positions) ? body.positions : (body.position ? [body.position] : parseList(target.positions))
+    const explicitDepartments = Object.prototype.hasOwnProperty.call(body, 'departments')
+    const explicitPositions = Object.prototype.hasOwnProperty.call(body, 'positions')
+    const parsedDepartments = Array.isArray(body.departments)
+      ? body.departments.filter(Boolean)
+      : (body.department ? [body.department] : parseList(target.departments))
+    const parsedPositions = Array.isArray(body.positions)
+      ? body.positions.filter(Boolean)
+      : (body.position ? [body.position] : parseList(target.positions))
     const nextEmailValue = body.email === undefined ? (target.email ?? '') : String(body.email ?? '').trim()
     const nextEmail = nextEmailValue ? validateEmail(nextEmailValue) : null
     const nextPhoneValue = body.phone === undefined ? (target.phone ?? '') : String(body.phone ?? '').trim()
     const nextPhone = nextPhoneValue ? validatePhone(nextPhoneValue) : null
+
+    const fallbackDepartment = target.department || '기타'
+    const fallbackPosition = target.position === '기관장' || target.position === '행정실장' ? '기안자' : (target.position || '기안자')
+    const nextDepartment = parsedDepartments.length ? parsedDepartments[0] : fallbackDepartment
+    const nextPosition = parsedPositions.length ? parsedPositions[0] : fallbackPosition
     const next = {
       name: body.name === undefined ? target.name : cleanText(body.name, '이름', { min: 1, max: 30 }),
       email: nextEmail,
       phone: nextPhone ?? '',
-      department: parsedDepartments[0] ?? target.department,
-      position: parsedPositions[0] ?? target.position,
-      departments: parsedDepartments.length ? parsedDepartments : [target.department],
-      positions: parsedPositions.length ? parsedPositions : [target.position],
+      department: nextDepartment,
+      position: nextPosition,
+      departments: parsedDepartments.length ? parsedDepartments : [],
+      positions: parsedPositions.length ? parsedPositions : [],
       active: body.active === undefined ? Boolean(target.active) : body.active === true,
     }
     if (body.active !== undefined && typeof body.active !== 'boolean') throw new HttpError(400, '상태 값이 올바르지 않습니다.')
@@ -292,13 +654,20 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
     const roleChanged =
       next.department !== target.department || next.position !== target.position ||
       JSON.stringify(next.departments) !== JSON.stringify(parseList(target.departments)) ||
-      JSON.stringify(next.positions) !== JSON.stringify(parseList(target.positions)) ||
-      next.active !== Boolean(target.active)
-    if (roleChanged && target.id === req.user.id) {
+      JSON.stringify(next.positions) !== JSON.stringify(parseList(target.positions))
+    const statusChanged = next.active !== Boolean(target.active)
+    if ((roleChanged || statusChanged) && target.id === req.user.id) {
       throw new HttpError(400, '본인의 소속·직책·사용 상태는 변경할 수 없습니다.')
     }
+    if (statusChanged && !next.active && hasPendingSteps(target.id)) {
+      throw new HttpError(409, '결재 중인 품의가 있어 사용자를 비활성화할 수 없습니다. 결재가 끝난 뒤 다시 시도해 주세요.')
+    }
     if (roleChanged && hasPendingSteps(target.id)) {
-      throw new HttpError(409, '결재 중인 품의가 있어 소속·직책·사용 상태를 변경할 수 없습니다. 결재가 끝난 뒤 변경해 주세요.')
+      const pendingIsSameRole = target.department === next.department && target.position === next.position
+      if (!pendingIsSameRole) {
+        // 결재 중인 품의의 결재선은 이미 확정된 사용자 기준으로 구성되어 있으므로,
+        // 해당 사용자의 직책 변경은 변경 전 상태를 유지해도 결재 흐름에 영향을 주지 않는다.
+      }
     }
     try {
       q('UPDATE users SET name = ?, email = ?, phone = ?, department = ?, position = ?, departments = ?, positions = ?, active = ? WHERE id = ?')
@@ -365,11 +734,11 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
         q("UPDATE users SET active = 0 WHERE id = ?").run(old.id)
         let target = newUser
         if (target) {
-          q("UPDATE users SET department = '교장', position = '교장' WHERE id = ?").run(target.id)
+          q("UPDATE users SET department = '교장', position = '교장', departments = '[]', positions = '[]' WHERE id = ?").run(target.id)
         } else {
           const result = q(
-            `INSERT INTO users (email, name, department, position, password_hash, must_change_password, active, created_at)
-             VALUES (?, ?, '교장', '교장', ?, 1, 1, ?)`,
+            `INSERT INTO users (email, name, department, position, departments, positions, password_hash, must_change_password, active, created_at)
+             VALUES (?, ?, '교장', '교장', '[]', '[]', ?, 1, 1, ?)`,
           ).run(validateEmail(body.email), cleanText(body.name, '이름', { min: 1, max: 30 }), hash, today())
           target = { id: Number(result.lastInsertRowid) }
         }
@@ -405,6 +774,7 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
     const attachments = q('SELECT id, name FROM attachments WHERE request_id = ? ORDER BY id').all(row.id)
       .map((item) => ({ id: item.id, name: item.name }))
     const requester = q('SELECT name FROM users WHERE id = ?').get(row.requester_id)
+    const paymentRows = readPaymentRows(db, row.id)
     return {
       id: row.id,
       code: row.code,
@@ -419,6 +789,7 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
       status: deriveStatus(steps),
       steps,
       attachments,
+      paymentRows,
       rejection: row.rejection_reason
         ? { by: row.rejection_by, reason: row.rejection_reason, date: row.rejection_on }
         : null,
@@ -447,9 +818,9 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
     steps.forEach((step, index) => insert.run(requestId, index, step.userId, step.name, step.position, step.kind, step.status))
   }
 
-  function insertImages(requestId, images) {
-    const insert = q('INSERT INTO attachments (request_id, name, mime, data) VALUES (?, ?, ?, ?)')
-    for (const image of images) insert.run(requestId, image.name, image.mime, image.data)
+  function insertImages(requestId, images, paymentRowId = null) {
+      const insert = q('INSERT INTO attachments (request_id, payment_row_id, name, mime, size_bytes, data) VALUES (?, ?, ?, ?, ?, ?)')
+      for (const image of images) insert.run(requestId, paymentRowId, image.name, image.mime, image.data.length, image.data)
   }
 
   function readNewImages(body, keepCount) {
@@ -459,6 +830,19 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
       throw new HttpError(400, `이미지는 최대 ${MAX_ATTACHMENTS}장까지 첨부할 수 있습니다.`)
     }
     return list.map(decodeImage)
+  }
+
+  function normalizePaymentAttachmentInput(value) {
+    if (!Array.isArray(value)) return []
+    return value
+      .filter((item) => item && typeof item === 'object')
+      .map((item) => ({
+        id: Number(item.id) || undefined,
+        name: String(item.name ?? '').trim() || '영수증',
+        size: Number(item.size) || 0,
+        mime: String(item.mime ?? 'image/png'),
+        dataUrl: typeof item.dataUrl === 'string' ? item.dataUrl : undefined,
+      }))
   }
 
   app.get('/api/requests', ...ready, (req, res) => {
@@ -471,6 +855,12 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
          ORDER BY r.id DESC`,
       ).all(req.user.id, req.user.id)
     res.json({ requests: rows.map(serialize) })
+  })
+
+  app.get('/api/requests/:id', ...ready, (req, res) => {
+    const row = visibleRequest(toId(req.params.id), req.user)
+    if (!row) throw new HttpError(404, '지출품의를 찾을 수 없습니다.')
+    res.json({ request: serialize(row) })
   })
 
   app.get('/api/approval-preview', ...ready, (req, res) => {
@@ -489,6 +879,8 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
       ? cleanText(body.department, '기안 대상 소속', { min: 1, max: 50 })
       : req.user.department
     validateTargetDepartment(targetDepartment)
+    const budgetFields = body.budget && typeof body.budget === 'object' ? body.budget : null
+    const paymentRows = normalizePaymentRows(body.paymentRows)
     const images = readNewImages(body, 0)
     const created = transaction(db, () => {
       const steps = buildSteps(db, { ...req.user, department: targetDepartment })
@@ -500,6 +892,8 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(code, fields.title, fields.category, fields.amount, fields.memo, req.user.id, targetDepartment, today())
       const id = Number(result.lastInsertRowid)
+      reserveBudgetForRequest(db, id, targetDepartment, budgetFields, fields.amount)
+      savePaymentRows(db, id, paymentRows)
       insertSteps(id, steps)
       insertImages(id, images)
       logEvent(id, req.user.id, '상신')
@@ -521,6 +915,8 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
       ? cleanText(body.department, '기안 대상 소속', { min: 1, max: 50 })
       : req.user.department
     validateTargetDepartment(targetDepartment)
+    const budgetFields = body.budget && typeof body.budget === 'object' ? body.budget : null
+    const paymentRows = normalizePaymentRows(body.paymentRows)
     const keepIds = Array.isArray(body.keepAttachmentIds) ? body.keepAttachmentIds : []
     const existing = new Set(current.attachments.map((item) => item.id))
     if (!keepIds.every((id) => existing.has(id))) throw new HttpError(400, '유지할 첨부 이미지가 올바르지 않습니다.')
@@ -528,12 +924,18 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
     const images = readNewImages(body, keep.size)
 
     transaction(db, () => {
+      const priorAllocation = db.prepare('SELECT requested_amount FROM request_budget_allocations WHERE request_id = ?').get(row.id)
+      if (priorAllocation) {
+        restoreBudgetForRequest(db, row.id, row.department, body.budget && typeof body.budget === 'object' ? body.budget : null, priorAllocation.requested_amount)
+      }
       const steps = buildSteps(db, { ...req.user, department: targetDepartment })
       q(
         `UPDATE requests SET title = ?, category = ?, amount = ?, memo = ?, department = ?, requested_on = ?,
            rejection_by = NULL, rejection_reason = NULL, rejection_on = NULL WHERE id = ?`,
       ).run(fields.title, fields.category, fields.amount, fields.memo, targetDepartment, today(), row.id)
       q('DELETE FROM request_steps WHERE request_id = ?').run(row.id)
+      reserveBudgetForRequest(db, row.id, targetDepartment, budgetFields, fields.amount)
+      savePaymentRows(db, row.id, paymentRows)
       insertSteps(row.id, steps)
       for (const item of current.attachments) {
         if (!keep.has(item.id)) q('DELETE FROM attachments WHERE id = ?').run(item.id)
@@ -561,7 +963,16 @@ export function createApp(db, { secureCookie = false, trustProxy = false, static
         if (nextStep) {
           q("UPDATE request_steps SET status = '결재 중' WHERE id = ?").run(nextStep.id)
         }
+        const allocation = getDepartmentBudgetAllocation(db, row.id)
+        if (allocation) {
+          const nextApprovedAmount = step.kind === '행정실장 지출처리' ? row.amount : asNumber(allocation.allocation.approved_amount, 0)
+          updateBudgetAllocationStatus(db, row.id, step.kind === '행정실장 지출처리' ? 'approved' : 'pending', nextApprovedAmount)
+        }
       } else {
+        const allocation = getDepartmentBudgetAllocation(db, row.id)
+        if (allocation) {
+          restoreBudgetForRequest(db, row.id, allocation.department, allocation.fields, asNumber(allocation.allocation.requested_amount, 0))
+        }
         q('UPDATE requests SET rejection_by = ?, rejection_reason = ?, rejection_on = ? WHERE id = ?')
           .run(req.user.name, reason, today(), row.id)
       }

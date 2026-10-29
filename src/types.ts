@@ -30,6 +30,25 @@ export interface Attachment {
   name: string
 }
 
+export interface PaymentAttachment {
+  id?: number
+  name: string
+  size?: number
+  mime?: string
+  dataUrl?: string
+}
+
+export interface PaymentRowEntry {
+  id?: number
+  seq?: number
+  summary: string
+  date: string
+  amount: number
+  payer: string
+  method: string
+  attachments?: PaymentAttachment[]
+}
+
 export interface ExpenseRequest {
   id: number
   code: string
@@ -44,6 +63,7 @@ export interface ExpenseRequest {
   status: RequestStatus
   steps: Required<ApprovalStep>[]
   attachments: Attachment[]
+  paymentRows: PaymentRowEntry[]
   rejection: { by: string; reason: string; date: string } | null
 }
 
@@ -81,6 +101,21 @@ export interface RequestPayload {
   amount: number
   memo: string
   department?: string
+  budget?: {
+    관: string
+    항: string
+    목: string
+    세목: string
+    내역: string
+  }
+  paymentRows?: Array<{
+    summary: string
+    date: string
+    amount: number
+    payer: string
+    method: string
+    attachments?: PaymentAttachment[]
+  }>
   newAttachments: NewImage[]
   keepAttachmentIds?: number[]
 }

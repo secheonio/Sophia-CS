@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
-import { after, before, describe, test } from 'node:test'
+import { after, afterEach, before, beforeEach, describe, test } from 'node:test'
 import { createApp } from './app.js'
-import { openDatabase } from './db.js'
+import { ensureApprovalRoutes, migrateLegacyRoleAssignments, openDatabase, syncUserDepartmentAssignments } from './db.js'
 import { generateTemporaryPassword, hashPassword } from './security.js'
+import { buildDepartmentRoles, derivePrimaryPosition, getSelectedPositions, sanitizeDepartmentRoles, toInternalRole } from '../src/userRoleLogic.js'
 
 // 1x1 PNG
 const PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=='
@@ -11,6 +12,31 @@ const PASSWORD = 'Sophia-test-1234'
 let server
 let base
 let db
+
+function resetDatabase() {
+  db.prepare('DELETE FROM sessions').run()
+  db.prepare('DELETE FROM attachments').run()
+  db.prepare('DELETE FROM request_payment_rows').run()
+  db.prepare('DELETE FROM request_budget_allocations').run()
+  db.prepare('DELETE FROM request_steps').run()
+  db.prepare('DELETE FROM request_events').run()
+  db.prepare('DELETE FROM requests').run()
+  db.prepare('DELETE FROM budget_rows').run()
+  db.prepare('DELETE FROM budget_master').run()
+  db.prepare('DELETE FROM users').run()
+  db.prepare("DELETE FROM sqlite_sequence WHERE name IN ('users', 'requests', 'request_steps', 'attachments', 'request_events', 'budget_master', 'budget_rows', 'request_budget_allocations', 'request_payment_rows')").run()
+}
+
+async function seedDatabase() {
+  resetDatabase()
+  await addUser('이교장', 'principal@test.kr', '교장', '교장')
+  await addUser('박행정', 'admin@test.kr', '행정실', '행정실장')
+  await addUser('김기초', 'head1@test.kr', '기초과정', '기관장')
+  await addUser('최교무', 'head2@test.kr', '교무부', '기관장')
+  await addUser('한기안', 'staff1@test.kr', '기초과정', '기안자')
+  await addUser('윤교무', 'staff2@test.kr', '교무부', '기안자')
+  await addUser('오본과', 'staff3@test.kr', '본과정', '기안자')
+}
 
 class Client {
   cookie = ''
@@ -51,16 +77,14 @@ const draft = (extra = {}) => ({ title: '교구 구입', category: '비품·소�
 
 before(async () => {
   db = openDatabase(':memory:')
-  await addUser('이교장', 'principal@test.kr', '교장', '교장')
-  await addUser('박행정', 'admin@test.kr', '행정실', '행정실장')
-  await addUser('김기초', 'head1@test.kr', '기초과정', '기관장')
-  await addUser('최교무', 'head2@test.kr', '교무부', '기관장')
-  await addUser('한기안', 'staff1@test.kr', '기초과정', '기안자')
-  await addUser('윤교무', 'staff2@test.kr', '교무부', '기안자')
-  await addUser('오본과', 'staff3@test.kr', '본과정', '기안자')
   const app = createApp(db)
   await new Promise((resolve) => { server = app.listen(0, '127.0.0.1', resolve) })
   base = `http://127.0.0.1:${server.address().port}`
+})
+
+beforeEach(async () => {
+  resetDatabase()
+  await seedDatabase()
 })
 
 after(() => {
@@ -106,7 +130,7 @@ describe('인증', () => {
     assert.equal(foreign.status, 403)
   })
 
-  test('임시 비밀번호는 변경하기 전에는 다른 기능을 쓸 수 없다', async () => {
+  test('임시 비밀번호는 새 비밀번호를 설정하면 되고, 이메일·전화번호는 선택 입력이다', async () => {
     const temporary = generateTemporaryPassword()
     db.prepare(
       `INSERT INTO users (email, name, department, position, password_hash, must_change_password, active, created_at)
@@ -117,7 +141,12 @@ describe('인증', () => {
     assert.equal(blocked.status, 403)
     assert.equal(blocked.json.code, 'PASSWORD_CHANGE_REQUIRED')
     assert.equal((await client.post('/api/auth/change-password', { currentPassword: temporary, newPassword: '1234' })).status, 400)
-    assert.equal((await client.post('/api/auth/change-password', { currentPassword: temporary, newPassword: 'Changed-pass-99' })).status, 200)
+    assert.equal((await client.post('/api/auth/change-password', {
+      currentPassword: temporary,
+      newPassword: 'Changed-pass-99',
+      email: '',
+      phone: '',
+    })).status, 200)
     assert.equal((await client.get('/api/me')).json.user.mustChangePassword, false)
     assert.equal((await client.get('/api/meta')).status, 200)
   })
@@ -131,12 +160,91 @@ describe('인증', () => {
       currentPassword: PASSWORD,
       newPassword: '',
       email: 'update-self-edit@test.kr',
-      phone: '010-1111-2222',
+      phone: '01011112222',
     })
     assert.equal(updated.status, 200)
     assert.equal(updated.json.user.email, 'update-self-edit@test.kr')
-    assert.equal(updated.json.user.phone, '010-1111-2222')
+    assert.equal(updated.json.user.phone, '01011112222')
     assert.equal(updated.json.user.mustChangePassword, false)
+  })
+})
+
+describe('정규화된 역할·결재 데이터', () => {
+  test('기존 사용자 데이터를 user_departments와 approval_routes로 마이그레이션한다', () => {
+    const migrated = openDatabase(':memory:')
+    migrated.prepare("INSERT INTO users (email, name, department, position, password_hash, must_change_password, active, created_at) VALUES (?, ?, ?, ?, ?, 0, 1, '2026-10-20')").run('migrate@test.kr', '마이그레이션', '기초과정', '기관장', 'hashed')
+    migrated.prepare("INSERT INTO users (email, name, department, position, password_hash, must_change_password, active, created_at) VALUES (?, ?, ?, ?, ?, 0, 1, '2026-10-20')").run('staff@test.kr', '직원', '기초과정', '기안자', 'hashed')
+    syncUserDepartmentAssignments(migrated)
+    ensureApprovalRoutes(migrated)
+    migrateLegacyRoleAssignments(migrated)
+
+    const departmentHead = migrated.prepare("SELECT department, role FROM user_departments WHERE user_id = (SELECT id FROM users WHERE email = ?) ORDER BY department").all('migrate@test.kr')
+    assert.deepEqual(departmentHead.map((row) => ({ department: row.department, role: row.role })), [{ department: '기초과정', role: '기관장' }])
+    const route = migrated.prepare('SELECT seq, role, kind FROM approval_routes WHERE department = ? ORDER BY seq').all('기초과정')
+    assert.equal(route.length, 4)
+    assert.equal(route[0].seq, 0)
+    assert.equal(route[0].role, '기관장')
+    assert.equal(route[0].kind, '소속장 결재')
+    assert.equal(route[3].seq, 3)
+    assert.equal(route[3].role, '행정실장')
+    assert.equal(route[3].kind, '행정실장 지출처리')
+  })
+})
+
+describe('소속/직책 규칙', () => {
+  test('부장은 여러 부서에 겸임될 수 있고, 다른 부서는 선택되지 않은 상태로 유지된다', () => {
+    const base = {
+      기초과정: '부장',
+      본과정: '부서원',
+      생활교육부: '부장',
+      교무부: '부서원',
+      기타: '없음',
+    }
+    const next = sanitizeDepartmentRoles(base, '기초과정')
+    assert.equal(next.기초과정, '부장')
+    assert.equal(next.생활교육부, '부장')
+    assert.equal(next.본과정, '없음')
+    assert.equal(next.교무부, '없음')
+
+    assert.deepEqual(getSelectedPositions({ 기초과정: '부장', 생활교육부: '부장' }), ['기관장', '기관장'])
+
+    const mapped = buildDepartmentRoles({
+      department: '기초과정',
+      position: '기관장',
+      departments: ['기초과정', '생활교육부'],
+      positions: ['기관장', '기관장'],
+    })
+    assert.equal(mapped.기초과정, '부장')
+    assert.equal(mapped.생활교육부, '부장')
+  })
+
+  test('모든 소속을 없음으로 바꾸면 직위는 기안자로 돌아간다', () => {
+    const roles = {
+      기초과정: '없음',
+      본과정: '없음',
+      심화과정: '없음',
+      교무부: '없음',
+      생활교육부: '없음',
+      교육과정연구부: '없음',
+      전형위원회: '없음',
+      생활관: '없음',
+      도서관: '없음',
+      델포이: '없음',
+      행정실: '없음',
+      기타: '없음',
+    }
+
+    assert.equal(derivePrimaryPosition('교육과정연구부', roles, '기관장'), '기안자')
+    assert.equal(derivePrimaryPosition('행정실', roles, '행정실장'), '기안자')
+  })
+
+  test('빈 소속/직책 배열을 보내면 기존 기관장 값이 유지되지 않고 기안자로 정리된다', async () => {
+    const principal = await login('이교장')
+    const userId = db.prepare("SELECT id FROM users WHERE name = '김기초'").get().id
+    const updated = await principal.patch(`/api/users/${userId}`, { departments: [], positions: [] })
+    assert.equal(updated.status, 200)
+    assert.equal(updated.json.user.position, '기안자')
+    assert.equal(updated.json.user.department, '기초과정')
   })
 })
 
@@ -285,8 +393,9 @@ const transferTests = () => describe('교장 교체', () => {
     const head = await login('head1@test.kr')
     assert.equal((await head.post('/api/principal/transfer', { name: 'x', email: 'x@test.kr', confirm: true })).status, 403)
     const principal = await login('principal@test.kr')
+    const targetId = db.prepare("SELECT id FROM users WHERE email = 'admin@test.kr'").get().id
     assert.equal((await principal.post('/api/principal/transfer', { name: 'x', email: 'x@test.kr' })).status, 400)
-    assert.equal((await principal.post('/api/principal/transfer', { userId: 2, confirm: true })).status, 400)
+    assert.equal((await principal.post('/api/principal/transfer', { userId: targetId, confirm: true })).status, 400)
   })
 
   test('새 교장 생성: 진행 중 결재가 넘어가고 과거 품의를 모두 볼 수 있다', async () => {
@@ -312,7 +421,16 @@ const transferTests = () => describe('교장 교체', () => {
 
     const next = await login('new.principal@test.kr', result.json.temporaryPassword)
     assert.equal((await next.get('/api/requests')).status, 403)
-    assert.equal((await next.post('/api/auth/change-password', { currentPassword: result.json.temporaryPassword, newPassword: 'New-principal-77' })).status, 200)
+    assert.equal((await next.post('/api/auth/change-password', {
+      currentPassword: result.json.temporaryPassword,
+      newPassword: 'New-principal-77',
+    })).status, 200)
+    assert.equal((await next.post('/api/auth/change-password', {
+      currentPassword: 'New-principal-77',
+      newPassword: 'New-principal-88',
+      email: 'new.principal@test.kr',
+      phone: '01098765432',
+    })).status, 200)
 
     const list = (await next.get('/api/requests')).json.requests
     assert.ok(list.some((item) => item.title === '교체 전 완료'))
@@ -326,7 +444,7 @@ const transferTests = () => describe('교장 교체', () => {
 
   test('기존 사용자를 교장으로 지정할 수 있고, 결재 중인 사용자와 행정실장은 막는다', async () => {
     await addUser('후보', 'cand@test.kr', '생활관', '기안자')
-    const principal = await login('new.principal@test.kr', 'New-principal-77')
+    const principal = await login('principal@test.kr')
     const users = (await principal.get('/api/users')).json.users
     const idOf = (email) => users.find((user) => user.email === email).id
     assert.equal((await principal.post('/api/principal/transfer', { userId: idOf('admin@test.kr'), confirm: true })).status, 400)
@@ -378,6 +496,15 @@ describe('사용자 관리', () => {
     assert.equal(created.json.temporaryPassword, 'sophia00')
   })
 
+  test('행정실 부장은 행정실장으로 변환되고, 일반 소속장은 기관장으로 유지된다', () => {
+    assert.equal(toInternalRole('부장', '행정실'), '행정실장')
+    assert.equal(toInternalRole('부장', '기초과정'), '기관장')
+    assert.deepEqual(getSelectedPositions({ 행정실: '부장', 기초과정: '부장' }), ['기관장', '행정실장'])
+    assert.equal(derivePrimaryPosition('행정실', { 행정실: '부장' }, '기안자'), '행정실장')
+    assert.equal(buildDepartmentRoles({ department: '행정실', position: '행정실장', departments: ['행정실'], positions: ['행정실장'] }).행정실, '부장')
+    assert.equal(buildDepartmentRoles({ department: '기초과정', position: '기관장', departments: ['기초과정'], positions: ['기관장'] }).기초과정, '부장')
+  })
+
   test('직책 규칙을 지킨다: 교장·행정실장 1명, 소속당 소속장 1명, 행정실은 행정실장만', async () => {
     const principal = await login('principal@test.kr')
     const add = (department, position, email) => principal.post('/api/users', { name: '시험', email, department, position })
@@ -407,6 +534,28 @@ describe('사용자 관리', () => {
       const attempt = await new Client().post('/api/auth/login', { email: 'staff3@test.kr', password: PASSWORD })
       assert.notEqual(attempt.status, 200)
     }
+  })
+
+  test('결재 중인 사용자의 직책 변경은 허용하고, 변경 직후에도 기존 결재는 유지된다', async () => {
+    const principal = await login('principal@test.kr')
+    const head = await login('head1@test.kr')
+    const pending = (await head.post('/api/requests', draft({ title: '역할 변경 후에도 진행 중 결재 유지' }))).json.request
+    assert.equal(pending.status, '결재 중')
+
+    const users = (await principal.get('/api/users')).json.users
+    const headUser = users.find((user) => user.email === 'head1@test.kr')
+    const updated = await principal.patch(`/api/users/${headUser.id}`, {
+      department: '기초과정',
+      position: '기안자',
+      departments: ['기초과정'],
+      positions: ['기안자'],
+      email: headUser.email,
+      phone: headUser.phone || '01000000000',
+      active: true,
+    })
+    assert.equal(updated.status, 200, JSON.stringify(updated.json))
+    assert.equal(updated.json.user.position, '기안자')
+    assert.equal((await head.get(`/api/requests/${pending.id}`)).json.request.status, '결재 중')
   })
 
   test('비밀번호를 초기화하면 기존 세션이 끊기고 새 임시 비밀번호가 필요하다', async () => {

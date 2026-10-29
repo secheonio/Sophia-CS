@@ -2,6 +2,8 @@ import { useState, type FormEvent } from 'react'
 import { api, ApiError } from './api'
 import type { User } from './types'
 
+const normalizePhoneInput = (value: string) => value.replace(/\D/g, '').slice(0, 11)
+
 export function LoginScreen({ onLogin }: { onLogin: (user: User) => void }) {
   const [name, setName] = useState('')
   const [password, setPassword] = useState('')
@@ -53,10 +55,13 @@ export function PasswordChange({ user, forced, onDone, onCancel, onLogout }: {
   const [confirm, setConfirm] = useState('')
   const [email, setEmail] = useState(user.email ?? '')
   const [phone, setPhone] = useState(user.phone ?? '')
+  const [showPasswordChange, setShowPasswordChange] = useState(false)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
-  const requireContact = forced || !user.email || !user.phone
-  const wantsPasswordChange = next.trim().length > 0 || confirm.trim().length > 0
+  const wantsPasswordChange = !forced && showPasswordChange && (next.trim().length > 0 || confirm.trim().length > 0)
+  const helperText = forced
+    ? '처음 로그인하신 경우, 새 비밀번호를 설정해 주세요. 이메일과 전화번호는 선택 입력이며 나중에도 수정할 수 있습니다.'
+    : '먼저 이메일과 전화번호를 수정하고, 비밀번호를 바꾸려면 아래에서 선택해 주세요. 현재 비밀번호를 계속 사용할 수도 있습니다.'
 
   async function submit(event: FormEvent) {
     event.preventDefault()
@@ -64,20 +69,12 @@ export function PasswordChange({ user, forced, onDone, onCancel, onLogout }: {
       setError('현재 비밀번호를 입력해 주세요.')
       return
     }
-    if (requireContact && !email.trim()) {
-      setError('이메일을 입력해 주세요.')
+    if (email.trim() && !email.trim().includes('@')) {
+      setError('이메일에는 @가 포함되어야 합니다.')
       return
     }
-    if (requireContact && !phone.trim()) {
-      setError('전화번호를 입력해 주세요.')
-      return
-    }
-    if (email.trim() && !/^[^@\s]+@[^@\s]+$/.test(email.trim())) {
-      setError('이메일 형식이 올바르지 않습니다. 예: anstnrdud@naver.com')
-      return
-    }
-    if (phone.trim() && !/^\d{3}-\d{4}-\d{4}$/.test(phone.trim())) {
-      setError('전화번호 형식이 올바르지 않습니다. 예: 010-1234-5678')
+    if (phone.trim() && !/^\d{10,11}$/.test(phone.trim())) {
+      setError('전화번호는 하이픈 없이 10~11자리 숫자만 입력해 주세요. (예: 01012345678)')
       return
     }
     if (wantsPasswordChange && next.trim().length < 8) {
@@ -95,8 +92,11 @@ export function PasswordChange({ user, forced, onDone, onCancel, onLogout }: {
     setBusy(true)
     setError('')
     try {
-      const contact = { email: email.trim(), phone: phone.trim() }
-      onDone((await api.changePassword(current, next.trim(), contact)).user)
+      const contact = {
+        ...(email.trim() ? { email: email.trim() } : {}),
+        ...(phone.trim() ? { phone: phone.trim() } : {}),
+      }
+      onDone((await api.changePassword(current, next.trim(), Object.keys(contact).length ? contact : undefined)).user)
     } catch (caught) {
       setError(caught instanceof ApiError ? caught.message : '정보를 변경하지 못했습니다.')
     } finally {
@@ -107,22 +107,44 @@ export function PasswordChange({ user, forced, onDone, onCancel, onLogout }: {
   const form = (
     <form className="auth-card" onSubmit={submit}>
       <h1>{forced ? '비밀번호 변경' : '내 정보 수정'}</h1>
-      <p>{forced ? `${user.name}님, 처음 사용하기 전에 새 비밀번호를 설정해 주세요.` : `${user.name}님의 이메일, 전화번호, 비밀번호를 수정할 수 있습니다.`}</p>
+      <p>{forced ? `${user.name}님, 안전한 사용을 위해 새 비밀번호를 설정해 주세요.` : `${user.name}님의 이메일, 전화번호, 비밀번호를 수정할 수 있습니다.`}</p>
+      <p className="auth-help" style={{ marginTop: 0 }}>{helperText}</p>
       <label className="form-field"><span>{forced ? '임시 비밀번호' : '현재 비밀번호'}</span>
         <input type="password" autoComplete="current-password" value={current} onChange={(e) => setCurrent(e.currentTarget.value)} required autoFocus />
       </label>
-      <label className="form-field"><span>이메일</span>
-        <input type="text" inputMode="email" pattern="^[^@\\s]+@[^@\\s]+$" title="anstnrdud@naver.com" value={email} onChange={(e) => setEmail(e.currentTarget.value)} required={requireContact} />
+      <label className="form-field"><span>이메일 (선택)</span>
+        <input type="text" inputMode="email" pattern=".*@.*" title="이메일에는 @가 포함되어야 합니다." value={email} onChange={(e) => setEmail(e.currentTarget.value)} />
       </label>
-      <label className="form-field"><span>전화번호</span>
-        <input type="tel" pattern="^\\d{3}-\\d{4}-\\d{4}$" title="010-1234-5678" value={phone} onChange={(e) => setPhone(e.currentTarget.value)} required={requireContact} />
+      <label className="form-field"><span>전화번호 (선택)</span>
+        <input type="tel" inputMode="numeric" pattern="^\d{10,11}$" title="01012345678" value={phone} onChange={(e) => setPhone(normalizePhoneInput(e.currentTarget.value))} />
       </label>
-      <label className="form-field"><span>{forced ? '새 비밀번호 (8자 이상)' : '새 비밀번호 (선택사항, 8자 이상)'}</span>
-        <input type="password" autoComplete="new-password" value={next} onChange={(e) => setNext(e.currentTarget.value)} minLength={8} />
-      </label>
-      <label className="form-field"><span>{forced ? '새 비밀번호 확인' : '새 비밀번호 확인 (선택사항)'}</span>
-        <input type="password" autoComplete="new-password" value={confirm} onChange={(e) => setConfirm(e.currentTarget.value)} />
-      </label>
+      {!forced && (
+        <label className="form-field" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <input
+            type="checkbox"
+            checked={showPasswordChange}
+            onChange={(e) => {
+              const nextChecked = e.currentTarget.checked
+              setShowPasswordChange(nextChecked)
+              if (!nextChecked) {
+                setNext('')
+                setConfirm('')
+              }
+            }}
+          />
+          <span>비밀번호를 변경할게요</span>
+        </label>
+      )}
+      {(forced || showPasswordChange) && (
+        <>
+          <label className="form-field"><span>{forced ? '새 비밀번호 (8자 이상)' : '새 비밀번호 (8자 이상)'}</span>
+            <input type="password" autoComplete="new-password" value={next} onChange={(e) => setNext(e.currentTarget.value)} minLength={8} />
+          </label>
+          <label className="form-field"><span>{forced ? '새 비밀번호 확인' : '새 비밀번호 확인'}</span>
+            <input type="password" autoComplete="new-password" value={confirm} onChange={(e) => setConfirm(e.currentTarget.value)} />
+          </label>
+        </>
+      )}
       {error && <p className="form-error" role="alert">{error}</p>}
       <div className="modal-footer">
         {onCancel && <button className="cancel-button" type="button" onClick={onCancel}>취소</button>}

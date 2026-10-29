@@ -1,6 +1,6 @@
 export const COURSE_DEPARTMENTS = ['기초과정', '본과정', '심화과정']
 export const DEPARTMENT_DEPARTMENTS = ['교무부', '생활교육부', '교육과정연구부']
-export const INSTITUTION_DEPARTMENTS = ['행정실', '델포이', '생활관', '전형위원회', '기타']
+export const INSTITUTION_DEPARTMENTS = ['행정실', '델포이', '생활관', '도서관', '전형위원회', '기타']
 export const DEPARTMENTS = [...COURSE_DEPARTMENTS, ...DEPARTMENT_DEPARTMENTS, ...INSTITUTION_DEPARTMENTS]
 export const CATEGORIES = ['교육활동비', '여비교통비', '비품·소모품', '시설·수선비', '복리후생비', '기타']
 export const POSITIONS = ['없음', '기안자', '기관장', '교장', '행정실장']
@@ -62,6 +62,8 @@ export function validateRole(department, position) {
   const allowed = departmentsByPosition()[position]
   if (!allowed) throw new HttpError(400, '올바르지 않은 직책입니다.')
   if (!allowed.includes(department)) {
+    if (position === '행정실장' && department === '행정실') return
+    if (position === '기관장' && department !== '교장' && department !== '행정실') return
     throw new HttpError(400, `${position}의 소속으로 선택할 수 없는 부서입니다.`)
   }
 }
@@ -85,17 +87,17 @@ export function cleanText(value, label, { min = 0, max }) {
 }
 
 export function validateEmail(value) {
-  const email = cleanText(value, '이메일', { min: 3, max: 120 }).toLowerCase()
-  if (!/^[^@\s]+@[^@\s]+$/.test(email)) {
-    throw new HttpError(400, '이메일 형식이 올바르지 않습니다. (예: sophia@school.or.kr)')
+  const email = cleanText(value, '이메일', { min: 1, max: 120 }).toLowerCase()
+  if (!email.includes('@')) {
+    throw new HttpError(400, '이메일은 @를 포함해야 합니다.')
   }
   return email
 }
 
 export function validatePhone(value) {
-  const phone = cleanText(value, '전화번호', { min: 10, max: 30 })
-  if (!/^\d{3}-\d{4}-\d{4}$/.test(phone)) {
-    throw new HttpError(400, '전화번호 형식이 올바르지 않습니다. (예: 010-1234-5678)')
+  const phone = cleanText(value, '전화번호', { min: 10, max: 11 })
+  if (!/^\d{10,11}$/.test(phone)) {
+    throw new HttpError(400, '전화번호 형식이 올바르지 않습니다. (예: 01012345678)')
   }
   return phone
 }
@@ -169,32 +171,61 @@ export function deriveStatus(steps) {
 // 기안자 → 선택한 소속의 장 결재 → 행정실장(교장 결재 대기중) → 교장 결재 → 행정실장 지출처리
 // 행정실장은 경유 단계에서 결재선을 잠시 보관하고, 교장 결재 후 최종 지출 처리 담당으로 이어진다.
 export function buildSteps(db, requester) {
-  const find = (sql, ...params) => db.prepare(sql).get(...params)
-  const principal = find("SELECT * FROM users WHERE position = '교장' AND active = 1")
-  const accountant = find("SELECT * FROM users WHERE position = '행정실장' AND active = 1")
-  if (!principal || !accountant) {
-    throw new HttpError(409, '교장 또는 행정실장이 지정되지 않아 결재선을 만들 수 없습니다. 관리자에게 문의해 주세요.')
-  }
-
   const targetDepartment = requester.department
-  const steps = []
-  const head = find(
-    "SELECT * FROM users WHERE position = '기관장' AND department = ? AND active = 1",
-    targetDepartment,
-  )
-  if (!head && targetDepartment !== '교장' && targetDepartment !== '행정실') {
+  const route = resolveApprovalUsers(db, targetDepartment)
+  const active = route.filter((step) => step.user)
+  if (targetDepartment !== '교장' && targetDepartment !== '행정실' && !active.some((step) => step.role === '기관장')) {
     throw new HttpError(409, `${targetDepartment}에 소속장이 지정되지 않아 결재선을 만들 수 없습니다. 관리자에게 문의해 주세요.`)
   }
-  if (head) steps.push({ user: head, kind: '소속장 결재' })
-  steps.push({ user: accountant, kind: '교장 결재 대기중' })
-  steps.push({ user: principal, kind: '교장 결재' })
-  steps.push({ user: accountant, kind: '행정실장 지출처리' })
 
-  return steps.map((step, index) => ({
+  if (active.length === 0) {
+    throw new HttpError(409, '결재선을 만들 수 없습니다. 관리자에게 문의해 주세요.')
+  }
+
+  return active.map((step, index) => ({
     userId: step.user.id,
     name: step.user.name,
     position: step.user.position,
     kind: step.kind,
     status: index === 0 ? '결재 중' : '대기',
   }))
+}
+
+export function getApprovalRouteTemplate(db, department) {
+  const rows = db.prepare(
+    'SELECT seq, role, kind FROM approval_routes WHERE department = ? ORDER BY seq ASC',
+  ).all(department)
+  if (!rows.length) {
+    return [
+      { seq: 0, role: '기관장', kind: '소속장 결재' },
+      { seq: 1, role: '행정실장', kind: '교장 결재 대기중' },
+      { seq: 2, role: '교장', kind: '교장 결재' },
+      { seq: 3, role: '행정실장', kind: '행정실장 지출처리' },
+    ]
+  }
+  return rows
+}
+
+export function resolveApprovalUsers(db, department) {
+  const route = getApprovalRouteTemplate(db, department)
+  return route.map((step) => {
+    const role = step.role
+    if (role === '교장') {
+      const user = db.prepare("SELECT * FROM users WHERE position = '교장' AND active = 1 ORDER BY id LIMIT 1").get()
+      return { ...step, user }
+    }
+    if (role === '행정실장') {
+      const user = db.prepare("SELECT * FROM users WHERE position = '행정실장' AND active = 1 ORDER BY id LIMIT 1").get()
+      return { ...step, user }
+    }
+    const user = db.prepare(
+      `SELECT u.*
+       FROM user_departments ud
+       JOIN users u ON u.id = ud.user_id
+       WHERE ud.department = ? AND ud.role = '기관장' AND ud.is_active = 1 AND u.active = 1
+       ORDER BY u.id
+       LIMIT 1`,
+    ).get(department) ?? db.prepare("SELECT * FROM users WHERE department = ? AND position = '기관장' AND active = 1 ORDER BY id LIMIT 1").get(department)
+    return { ...step, user }
+  })
 }
